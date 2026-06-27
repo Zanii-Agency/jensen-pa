@@ -145,11 +145,12 @@ async function countBurst(db: any, party: string): Promise<number> {
 export async function settleForBurst(
   getCount: () => Promise<number>,
   opts: { capMs?: number; quietMs?: number; pollMs?: number } = {},
-): Promise<void> {
+): Promise<{ waitedMs: number; cappedOut: boolean }> {
   const capMs = opts.capMs ?? SETTLE_CAP_MS;
   const quietMs = opts.quietMs ?? QUIET_MS;
   const pollMs = opts.pollMs ?? POLL_MS;
-  const deadline = Date.now() + capMs;
+  const start = Date.now();
+  const deadline = start + capMs;
   let lastCount = await getCount();
   let quietSince = Date.now();
   while (Date.now() < deadline) {
@@ -161,9 +162,10 @@ export async function settleForBurst(
       lastCount = c; // new inbound landed -> the human is still typing, keep waiting
       quietSince = Date.now();
     } else if (Date.now() - quietSince >= quietMs) {
-      return; // quiet long enough -> assemble now
+      return { waitedMs: Date.now() - start, cappedOut: false }; // quiet -> assemble
     }
   }
+  return { waitedMs: Date.now() - start, cappedOut: true };
 }
 
 // Assemble the burst: ALL inbound (role='user') for this party SINCE the last
@@ -232,12 +234,14 @@ export async function coalesceTurn(
 
   // WINNER. Settle (adaptively) so the rest of the human's burst lands, then assemble.
   try {
-    await settleForBurst(() => countBurst(db, party));
+    const settle = await settleForBurst(() => countBurst(db, party));
     const { command, ids } = await assembleBurst(db, party);
     // Empty burst read (rows already past a prior assistant boundary, or a
     // transient miss) -> fall back to the single message so we still reply.
     const finalCommand = command && command.trim() ? command : fallbackCommand;
-    await emitCoalesce("winner", sender, { burst: ids.length, chars: finalCommand.length });
+    // settle_ms is the LIVE discriminator for the adaptive-settle deploy: a quiet
+    // single message reads ~QUIET_MS (2500), never the old flat 7000.
+    await emitCoalesce("winner", sender, { burst: ids.length, chars: finalCommand.length, settle_ms: settle.waitedMs, capped: settle.cappedOut });
     return { proceed: true, winner: true, command: finalCommand, claimedIds: ids };
   } catch (e: any) {
     // Assembly failed AFTER we won. Release the claim so the next message can
