@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 
-import { extractAnyUrl, extractMeetingLink, resolveEventByIdentity } from "../lib/digital-u.ts";
+import { extractAnyUrl, extractMeetingLink, resolveEventByIdentity } from "../../lib/digital-u.ts";
 
 // --- Incident C: Luma link silently dropped (22 Jun) ---
 test("incident C: a Luma link IS captured (link-first, not platform-gated)", () => {

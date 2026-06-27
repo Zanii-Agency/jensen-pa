@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 
-import { settleForBurst } from "../lib/whatsapp-coalesce.ts";
+import { settleForBurst } from "../../lib/whatsapp-coalesce.ts";
 
 const OPTS = { capMs: 400, quietMs: 100, pollMs: 20 };
 
