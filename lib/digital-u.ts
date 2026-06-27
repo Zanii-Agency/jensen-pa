@@ -13,11 +13,58 @@ const MEET_RE = /(https?:\/\/(?:meet\.google\.com|[^\s]*\.zoom\.us|teams\.(?:mic
 
 // Pulls the first Meet/Zoom/Teams URL out of free text. Trailing punctuation
 // (commas, full stops, parens, quotes) is trimmed because messaging clients
-// frequently append them to URLs.
+// frequently append them to URLs. Use this ONLY to decide "is this a platform
+// my note-taker can join". For "is there a link to SAVE", use extractAnyUrl.
 export function extractMeetingLink(text: string): string | null {
   const m = String(text || "").match(MEET_RE);
   if (!m) return null;
   return m[1].replace(/[).,;'"!?\]]+$/, "");
+}
+
+// Link-first capture (Jensen-elevation Phase 1). Pulls the first http(s) URL of
+// ANY host. The old code gated link-save on MEET_RE (Meet/Zoom/Teams only), so a
+// Luma invite (`luma.com/DubaiTechTues...`, 22 Jun) was silently dropped and the
+// bot lied "the Luma link is saved in the notes". A link is a durable fact about
+// a meeting regardless of host: capture it, classify the platform separately.
+const ANY_URL_RE = /(https?:\/\/[^\s]+)/i;
+export function extractAnyUrl(text: string): string | null {
+  const m = String(text || "").match(ANY_URL_RE);
+  if (!m) return null;
+  return m[1].replace(/[).,;'"!?\]]+$/, "");
+}
+
+// Words that carry NO meeting identity. The old matcher (route.ts) matched a link
+// to an event if ANY word >3 chars in the message appeared in an event title, so
+// "sotiris meeting ... with this link" fuzz-matched "Meeting with A2 Milk" on the
+// word "meeting" and attached Sotiris's link to A2 Milk (25 Jun, incident D). An
+// identity match must ignore these scaffold words and require a DISTINCTIVE token.
+const TITLE_STOPWORDS = new Set([
+  "meeting", "meet", "call", "with", "the", "and", "for", "this", "that", "your",
+  "send", "link", "reminder", "tomorrow", "today", "join", "take", "notes", "noon",
+  "morning", "evening", "afternoon", "pm", "am", "at", "on", "to", "me", "a2",
+]);
+
+// Resolve which existing event a free-text message refers to, by IDENTITY not
+// fuzzy substring. Returns the single event whose title shares a distinctive
+// (non-stopword, >3 char) token with the message, or null when there is no
+// confident single match (ambiguous or none -> caller parks the link + asks,
+// never guesses, never silent-drops). zanii-codef: deliberately conservative —
+// a wrong attach is worse than an honest "which meeting?".
+export function resolveEventByIdentity(
+  message: string,
+  events: { id: string; title: string }[],
+): { id: string; title: string } | null {
+  const tokens = String(message || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 3 && !TITLE_STOPWORDS.has(w));
+  if (!tokens.length) return null;
+  const hits = events.filter((e) => {
+    const t = (e.title || "").toLowerCase();
+    return tokens.some((w) => t.includes(w));
+  });
+  return hits.length === 1 ? { id: hits[0].id, title: hits[0].title } : null;
 }
 
 // Decide what meeting_url to persist on a calendar write. An explicit value the
