@@ -61,3 +61,14 @@ test("incident B: link for a not-yet-created meeting resolves to NOTHING (-> par
   const r = resolveEventByIdentity("sotiris meeting tomorrow with this link", [{ id: "a2", title: "Meeting with A2 Milk" }]);
   assert.equal(r, null, "no Sotiris event yet -> no match -> park the link");
 });
+
+// --- Skeptic F2: substring false positives must NOT match (whole-token only) ---
+test("F2: 'plan' does not match 'Planning offsite' (substring guard)", () => {
+  assert.equal(resolveEventByIdentity("plan with sam below", [{ id: "p", title: "Planning offsite" }]), null);
+});
+test("F2: 'cart' does not match 'Descartes strategy' (substring guard)", () => {
+  assert.equal(resolveEventByIdentity("cart review link", [{ id: "d", title: "Descartes strategy" }]), null);
+});
+test("F2: a whole-token name still matches", () => {
+  assert.equal(resolveEventByIdentity("khalid sync link below", [{ id: "k", title: "Khalid sync" }])?.id, "k");
+});

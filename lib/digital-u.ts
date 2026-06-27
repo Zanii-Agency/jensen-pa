@@ -50,21 +50,22 @@ const TITLE_STOPWORDS = new Set([
 // confident single match (ambiguous or none -> caller parks the link + asks,
 // never guesses, never silent-drops). zanii-codef: deliberately conservative —
 // a wrong attach is worse than an honest "which meeting?".
-export function resolveEventByIdentity(
+const normTokens = (s: string): string[] =>
+  String(s || "").toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(Boolean);
+
+export function resolveEventByIdentity<T extends { title: string }>(
   message: string,
-  events: { id: string; title: string }[],
-): { id: string; title: string } | null {
-  const tokens = String(message || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(/\s+/)
-    .filter((w) => w.length > 3 && !TITLE_STOPWORDS.has(w));
+  events: T[],
+): T | null {
+  const tokens = normTokens(message).filter((w) => w.length > 3 && !TITLE_STOPWORDS.has(w));
   if (!tokens.length) return null;
   const hits = events.filter((e) => {
-    const t = (e.title || "").toLowerCase();
-    return tokens.some((w) => t.includes(w));
+    // WHOLE-token match, not substring: "plan" must not match "Planning", "cart"
+    // must not match "Descartes" (skeptic F2). Intersect distinct token sets.
+    const titleTokens = new Set(normTokens(e.title));
+    return tokens.some((w) => titleTokens.has(w));
   });
-  return hits.length === 1 ? { id: hits[0].id, title: hits[0].title } : null;
+  return hits.length === 1 ? hits[0] : null;
 }
 
 // Decide what meeting_url to persist on a calendar write. An explicit value the
@@ -74,10 +75,12 @@ export function resolveEventByIdentity(
 // 25 Jun, the bot even said "Teams link saved" and saved nothing). KT #206573.
 export function meetingUrlForWrite(explicit: string | undefined | null, lastInbound: string | undefined | null): string | undefined {
   if (explicit && String(explicit).trim()) {
-    const inExplicit = extractMeetingLink(String(explicit));
+    const inExplicit = extractAnyUrl(String(explicit));
     return inExplicit || String(explicit).trim();
   }
-  return extractMeetingLink(String(lastInbound || "")) || undefined;
+  // Broadened to any URL (Phase 1): the old extractMeetingLink gate dropped a
+  // Luma invite link on the brain-create path too, not just the WhatsApp paste.
+  return extractAnyUrl(String(lastInbound || "")) || undefined;
 }
 
 function siteUrl(): string {

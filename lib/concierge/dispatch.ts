@@ -17,6 +17,7 @@ import { sbSelect, enc } from "./rest";
 import { sendWhatsAppDocument, devPhone, whoIs } from "../whatsapp";
 import { signedReceiptUrl } from "../storage";
 import { meetingUrlForWrite } from "../digital-u";
+import { takeParkedLinkFor } from "../pending-links";
 import { selectProposedTasks } from "./meeting-proposal.mjs";
 
 type Result = any;
@@ -104,7 +105,14 @@ async function attachMeetingLink(ctx: { party?: string } | undefined, input: any
     if (!ctx?.party) return;
     const last = await jensenDiscriminatorAdapters(ctx).getLastUserInbound();
     const url = meetingUrlForWrite(undefined, String(last || ""));
-    if (url) input.meetingUrl = url;
+    if (url) { input.meetingUrl = url; return; }
+    // No link in this message. A link may have been PARKED earlier for this exact
+    // meeting (incident B: link sent before the event existed). Claim it now, only
+    // if the parked link's original message identity-names this event's title.
+    if (input?.title) {
+      const parked = await takeParkedLinkFor(ctx.party, String(input.title));
+      if (parked) input.meetingUrl = parked;
+    }
   } catch { /* best-effort; never block the write */ }
 }
 

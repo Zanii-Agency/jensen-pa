@@ -201,7 +201,7 @@ check("seam.34 reminder surfaces the meeting link at reminder time", () => {
 
 check("seam.35 meeting link: saved onto event; future scheduled, ad-hoc/now joined immediately, dispatch awaited", () => {
   const src = read("app/api/whatsapp/route.ts");
-  if (!/meeting_url: meetingLink/.test(src)) return "meeting link not saved onto the event";
+  if (!/meeting_url: anyLink/.test(src)) return "meeting link not saved onto the event";
   if (!/scheduledAt: future \?/.test(src)) return "future calendar match is not scheduled at meeting time";
   if (!/const d = await dispatchMeetingBot/.test(src)) return "dispatch is not awaited (serverless can SIGTERM a fire-and-forget dispatch before it lands)";
   if (!/sending Digital Jensen into/i.test(src)) return "no immediate-join path for ad-hoc / now meetings";
@@ -245,9 +245,13 @@ check("seam.40 briefs never claim 'clean board' on a read error", () => {
   return null;
 });
 
-check("seam.41 meeting-link ack checks the write before saying 'Saved'", () => {
+check("seam.41 meeting-link ack reads the row back before saying 'Saved' (no PATCH-flag trust)", () => {
   const src = read("app/api/whatsapp/route.ts");
-  if (!/saved = await fetch/.test(src)) return "meeting-link PATCH result not captured";
+  // Phase 1: saved must be derived from a READ-BACK of the row, not the PATCH ok
+  // flag (which lied "saved in notes"). The strengthened invariant.
+  if (!/const patchedOk = await fetch/.test(src)) return "PATCH ok flag not captured (F4: idempotent/failed write could falsely claim saved)";
+  if (!/saved = patchedOk &&/.test(src)) return "saved does not require the PATCH to have succeeded this turn";
+  if (!/meeting_url === anyLink/.test(src)) return "saved is not derived from a read-back equality on the stored link";
   if (!/saved\s*\?/.test(src)) return "ack does not branch on whether the save succeeded";
   return null;
 });
