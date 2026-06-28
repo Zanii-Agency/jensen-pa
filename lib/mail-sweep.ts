@@ -13,6 +13,7 @@
 
 import { aggregateInbox, readUnified, type UMailSummary } from "@/lib/mail-provider";
 import { triageInbox, type TriagedMail } from "@/lib/mail-triage";
+import { rememberEmail } from "@/lib/concierge/brain";
 import { sendTextAndLog } from "@/lib/sendTextAndLog";
 import { kvGet, kvSet } from "@/lib/db";
 import { whoIs } from "@/lib/whatsapp";
@@ -360,6 +361,12 @@ export async function sweepAndPropose(): Promise<SweepResult> {
           const full = await readUnified(m.id);
           if (full?.text) withBody.snippet = full.text;
         } catch { /* use snippet or summary fallback */ }
+        // Capture the email content into the brain so a later reference resolves
+        // ("what did Khalid email about"). Skip Q4 noise (newsletters/receipts).
+        // Best-effort: memory must never block surfacing the mail.
+        if (m.quadrant !== 4) {
+          void rememberEmail({ from: m.from, fromEmail: m.fromEmail, subject: m.subject, date: m.date, body: withBody.snippet || m.summary }).catch(() => {});
+        }
         const r = await sendTextAndLog(to, buildEmailBody(withBody), { party: "jensen" });
         if (r.ok) await sendTextAndLog(to, m.needsSteer ? buildSteerAsk(m) : buildDraft(m), { party: "jensen" });
         if (r.ok) proposed++;
