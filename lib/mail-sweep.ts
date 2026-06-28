@@ -219,6 +219,27 @@ export async function sweepAndPropose(): Promise<SweepResult> {
     } catch {}
   }
 
+  // FULL-AWARENESS CAPTURE (root-cause node). Persist EVERY email the bot saw
+  // this sweep to the brain, BEFORE any window / needsReply / coalesce
+  // narrowing. Previously rememberEmail lived inside the in-window proposal
+  // branch, so off-window emails (Jensen away >24h), FYI / no-reply-needed
+  // emails, and coalesced-away thread siblings were never remembered — the
+  // flat-window amnesia (see memento: dorje-12-message-window-context-amnesia).
+  // Capturing once here, where the bot actually reads the mail, closes that gap.
+  // The full body is fetched once and pinned onto m.snippet so the later display
+  // path reuses it (no double fetch). Q4 (newsletters / auto-receipts) stays out
+  // of durable memory by design — flip the `!== 4` guard to include it.
+  // zanii-codef: one readUnified per non-Q4 email/sweep; fall back to the
+  // provider snippet if a busy inbox ever makes the per-tick fetch cost bite.
+  for (const m of triaged) {
+    if (m.quadrant === 4) continue;
+    try {
+      const full = await readUnified(m.id);
+      if (full?.text) m.snippet = full.text;
+    } catch { /* keep the provider bodyPreview snippet */ }
+    void rememberEmail({ from: m.from, fromEmail: m.fromEmail, subject: m.subject, date: m.date, body: m.snippet || m.summary }).catch(() => {});
+  }
+
   // AUTO-LATCH for meetings. Any triaged email whose event extractor surfaced
   // a meetingUrl + concrete date+time gets scheduled with the meeting-bot
   // (30s before joinAt). Idempotent: the kv "latched" set keeps the same
@@ -353,21 +374,10 @@ export async function sweepAndPropose(): Promise<SweepResult> {
   for (const m of coalesced) {
     try {
       if (win.open) {
-        // Fetch the full email body so the user sees the actual content, not the
-        // AI summary. Best-effort: if the fetch fails, fall through to snippet
-        // or summary (buildEmailBody handles that).
-        const withBody = { ...m };
-        try {
-          const full = await readUnified(m.id);
-          if (full?.text) withBody.snippet = full.text;
-        } catch { /* use snippet or summary fallback */ }
-        // Capture the email content into the brain so a later reference resolves
-        // ("what did Khalid email about"). Skip Q4 noise (newsletters/receipts).
-        // Best-effort: memory must never block surfacing the mail.
-        if (m.quadrant !== 4) {
-          void rememberEmail({ from: m.from, fromEmail: m.fromEmail, subject: m.subject, date: m.date, body: withBody.snippet || m.summary }).catch(() => {});
-        }
-        const r = await sendTextAndLog(to, buildEmailBody(withBody), { party: "jensen" });
+        // Full body was already fetched and pinned to m.snippet by the
+        // full-awareness capture loop above, so the bubble shows the real
+        // content with no second fetch.
+        const r = await sendTextAndLog(to, buildEmailBody(m), { party: "jensen" });
         if (r.ok) await sendTextAndLog(to, m.needsSteer ? buildSteerAsk(m) : buildDraft(m), { party: "jensen" });
         if (r.ok) proposed++;
         else errors.push(`whatsapp send failed for ${m.id}`);
@@ -388,4 +398,35 @@ export async function sweepAndPropose(): Promise<SweepResult> {
   }
 
   return { ok: errors.length === 0, scanned: aggregated.length, newUnseen: unseen.length, proposed, filteredNoise, notNeedingReply, seeded: false, windowOpen: win.open, queued, drained, errors: errors.length ? errors : undefined };
+}
+
+// Daily full-inbox MEMORY sweep. Reads the recent inbox across every connected
+// account and remembers every non-noise email (full body) to the brain — so
+// awareness never depends on Jensen opening a mail or the 5-min new-mail sweep
+// catching it. SILENT: no proposals, no WhatsApp, so it runs regardless of
+// onboarding state. Idempotent: rememberEmail dedups on content, so re-running
+// daily never piles up duplicates. Best-effort per email; one failure never
+// aborts the rest.
+export async function sweepAndRememberAll(perAccount = 60): Promise<{ ok: boolean; scanned: number; remembered: number; skippedNoise: number; errors?: string[] }> {
+  let mails: UMailSummary[] = [];
+  try {
+    mails = await aggregateInbox(perAccount);
+  } catch (e: any) {
+    return { ok: false, scanned: 0, remembered: 0, skippedNoise: 0, errors: [`aggregate: ${e?.message || String(e)}`] };
+  }
+  const errors: string[] = [];
+  let remembered = 0;
+  let skippedNoise = 0;
+  for (const m of mails) {
+    if (isNoise(m.fromEmail)) { skippedNoise++; continue; }
+    try {
+      let body = m.snippet;
+      try { const full = await readUnified(m.id); if (full?.text) body = full.text; } catch { /* snippet fallback */ }
+      await rememberEmail({ from: m.from, fromEmail: m.fromEmail, subject: m.subject, date: m.date, body });
+      remembered++;
+    } catch (e: any) {
+      errors.push(`remember ${m.id}: ${e?.message || String(e)}`);
+    }
+  }
+  return { ok: errors.length === 0, scanned: mails.length, remembered, skippedNoise, errors: errors.length ? errors : undefined };
 }

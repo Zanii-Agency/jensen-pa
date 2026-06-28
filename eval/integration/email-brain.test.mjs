@@ -21,8 +21,8 @@ test("a person reference can be found in the fact text", () => {
 });
 
 test("body is whitespace-collapsed and capped (no giant rows)", () => {
-  const f = emailFactText({ from: "X", subject: "s", body: "a\n\n  b   c".repeat(500) });
-  assert.ok(f.length <= 900, `capped (got ${f.length})`);
+  const f = emailFactText({ from: "X", subject: "s", body: "a\n\n  b   c".repeat(2000) });
+  assert.ok(f.length <= 4000, `capped (got ${f.length})`);
   assert.ok(!/\n/.test(f), "newlines collapsed");
 });
 

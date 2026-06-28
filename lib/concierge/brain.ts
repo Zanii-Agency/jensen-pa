@@ -60,8 +60,12 @@ export function emailFactText(m: { from?: string; fromEmail?: string; subject?: 
   const who = [m.from, m.fromEmail && m.fromEmail !== m.from ? `<${m.fromEmail}>` : ""].filter(Boolean).join(" ");
   const when = m.date ? ` on ${m.date}` : "";
   const subj = m.subject ? ` re "${m.subject}"` : "";
-  const body = String(m.body || "").replace(/\s+/g, " ").trim().slice(0, 700);
-  return `Email from ${who || "unknown sender"}${when}${subj}: ${body}`.slice(0, 900);
+  // Full awareness: keep the whole body up to the embed window (tryEmbed slices
+  // to 4000), so a long contract/brief is remembered in full, not gutted to a
+  // preview. zanii-codef: cap = embed cap; raise both together if we ever embed
+  // longer.
+  const body = String(m.body || "").replace(/\s+/g, " ").trim().slice(0, 3800);
+  return `Email from ${who || "unknown sender"}${when}${subj}: ${body}`.slice(0, 4000);
 }
 
 // Persist an email the owner saw. subject-column = sender so recall by person

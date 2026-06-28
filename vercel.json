@@ -24,6 +24,10 @@
     {
       "path": "/api/cron/monitor",
       "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/mail-memory",
+      "schedule": "0 2 * * *"
     }
   ]
 }
