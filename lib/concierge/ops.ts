@@ -63,7 +63,48 @@ export async function listEntities(f: { kind?: string; status?: string } = {}) {
   return sbSelect("entities", qs);
 }
 export async function findEntity(name: string) { return sbSelect("entities", `name=${like(name)}&limit=5`); }
+// Normalized identity key for people/entities: lowercase, strip punctuation,
+// collapse spaces. EXACT match only — "Karafotias" == "karafotias" but NOT a
+// spelling variant ("Jatin" vs "Jhatin"), which would risk merging two real people.
+export function normalizeName(s: string): string {
+  return (s || "").toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+}
+
+// Pure dedup decision for contacts (testable). The id of the SINGLE existing
+// same-name contact whose identity is COMPATIBLE (no conflicting email/phone), or
+// null. Conflicting identity (different email/phone) or ambiguity -> null (insert
+// new; never merge two distinct people who share a name).
+export function pickContactDup(
+  existing: { id: string; name: string; email?: string | null; phone?: string | null }[],
+  name: string,
+  email?: string | null,
+  phone?: string | null,
+): string | null {
+  const key = normalizeName(name);
+  if (!key) return null;
+  const e = (email || "").toLowerCase().trim();
+  const p = (phone || "").replace(/\D/g, "");
+  // Skeptic CRITICAL: a same-NAME match is NOT enough to merge — two different
+  // people share a first name (Ahmed the driver vs Ahmed the supplier), both
+  // blank, would be wrong-merged. Require a POSITIVE shared identity signal
+  // (matching email or phone). Name-only collisions insert a new row (a harmless
+  // extra the owner can merge), never a silent wrong-merge.
+  if (!e && !p) return null;
+  const confirmed = (existing || []).filter((c) => {
+    if (normalizeName(c.name) !== key) return false;
+    const ce = (c.email || "").toLowerCase().trim();
+    const cp = (c.phone || "").replace(/\D/g, "");
+    return (!!e && ce === e) || (!!p && cp === p);
+  });
+  return confirmed.length === 1 ? confirmed[0].id : null;
+}
+
 export async function createEntity(i: { kind: string; name: string; subtitle?: string; status?: string; notes?: string }) {
+  // No auto-dedup here (skeptic CRITICAL): entities have no secondary identity
+  // signal, so name-only merge would silently alias two distinct same-named orgs
+  // ("A&B Catering" vs "AB Catering", two clients named "Sohum"). findEntity lets
+  // the model look up first; a real duplicate is a human-confirmed merge, not a
+  // silent one. Insert-only is the safe choice (an extra row beats a wrong-merge).
   const row = { id: uid(), kind: i.kind, name: i.name, subtitle: i.subtitle ?? null, status: i.status ?? null, notes: i.notes ?? null, created_at: now() };
   await sbInsert("entities", row);
   return { id: row.id, kind: i.kind, name: i.name };
@@ -311,6 +352,22 @@ export async function deleteNote(id: string) { await sbDelete("notes", `id=eq.${
 export async function listContacts() { return sbSelect("contacts", "order=created_at.desc"); }
 export async function findContact(q: string) { return sbSelect("contacts", `or=(name.${like(q)},company.${like(q)})&limit=8`); }
 export async function addContact(i: { name: string; company?: string; role?: string; email?: string; phone?: string; entityId?: string }) {
+  // Dedup (the recurring "same person" / duplicate-contact friction): a same-name
+  // compatible contact already exists -> enrich its blank fields instead of making
+  // a second row. Conflicting email/phone -> different person -> insert new.
+  const existing = await sbSelect<any>("contacts", `order=created_at.asc&select=id,name,email,phone,company,role,entity_id&limit=200`).catch(() => []);
+  const dupId = pickContactDup(existing as any[], i.name, i.email, i.phone);
+  if (dupId) {
+    const cur = (existing as any[]).find((c) => c.id === dupId) || {};
+    const patch: any = {};
+    if (i.email && !cur.email) patch.email = i.email;
+    if (i.phone && !cur.phone) patch.phone = i.phone;
+    if (i.company && !cur.company) patch.company = i.company;
+    if (i.role && !cur.role) patch.role = i.role;
+    if (i.entityId && !cur.entity_id) patch.entity_id = i.entityId;
+    if (Object.keys(patch).length) await sbUpdate("contacts", `id=eq.${enc(dupId)}`, patch).catch(() => {});
+    return { id: dupId, name: i.name, deduped: true };
+  }
   const row = { id: uid(), name: i.name, company: i.company ?? null, role: i.role ?? null, email: i.email ?? null, phone: i.phone ?? null, entity_id: i.entityId ?? null, created_at: now() };
   await sbInsert("contacts", row);
   return { id: row.id, name: i.name };
