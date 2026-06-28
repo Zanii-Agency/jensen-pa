@@ -447,12 +447,24 @@ check("seam.23 DESTRUCTIVE set covers all delete_*, reply_email, call_owner, for
   return null;
 });
 
-check("seam.24 dispatch destructiveGate honors confirm:true bypass", () => {
+check("seam.24 destructiveGate confirms on the OWNER'S reply, never a model-set confirm (C1 fix)", () => {
   const src = read("lib/concierge/dispatch.ts");
   const fnMatch = src.match(/function destructiveGate\([^)]*\)[\s\S]*?\n\}/);
   if (!fnMatch) return "destructiveGate function body not parseable";
   const body = fnMatch[0];
-  if (!/input\?\.confirm\s*===\s*true/.test(body)) return "no confirm:true bypass — model can never execute confirmed deletes";
+  // The C1 hole was `input?.confirm === true` (model self-confirms). It must be GONE.
+  if (/input\?\.confirm\s*===\s*true/.test(body)) return "C1 STILL OPEN: model-supplied confirm:true is trusted (self-gatable)";
+  // The gate must key off the owner's actual inbound being an affirmation.
+  if (!/isConfirmation\(lastUser\)/.test(body)) return "gate does not validate the owner's real confirmation reply";
+  if (!/_confirmed === true/.test(body)) return "server-set _confirmed path missing";
+  return null;
+});
+
+check("seam.24b one destructive action per turn (a single yes can't unlock a batch)", () => {
+  const src = read("lib/concierge/loop.ts");
+  if (!/destructiveUsedThisTurn/.test(src)) return "no per-turn destructive counter";
+  if (!/isDestructive\(tu\.name\)/.test(src)) return "loop does not check destructive per tool_use";
+  if (!/destructiveUsedThisTurn >= 1/.test(src)) return "2nd destructive in a turn is not refused";
   return null;
 });
 

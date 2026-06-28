@@ -163,16 +163,41 @@ const DESTRUCTIVE = new Set([
   "sanad_draft_contract",
 ]);
 
-function destructiveGate(name: string, input: any): { ok: boolean; error?: string } | null {
+// A genuine affirmation FROM THE OWNER (not the model). Bounded so "yesterday"
+// and the like never match; negations ("no, don't") never match.
+const CONFIRM_RE = /\b(yes+|yep|yeah|yup|ya|okay|ok|k|sure|fine|correct|right|absolutely|100%?|confirm|confirmed|go ahead|go for it|do it|do that|send it|delete it|please do|that'?s right|approved)\b|👍/i;
+export function isConfirmation(text: string): boolean {
+  // Skeptic #6: a coalesced burst joins lines with "\n"; the owner's FINAL line
+  // governs. "yes\nactually wait no" must read as the reversal, not the yes.
+  const lines = String(text || "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const t = lines[lines.length - 1] || "";
+  if (!t) return false;
+  if (/\b(no|don'?t|do not|cancel|stop|wait|not yet|never ?mind)\b/i.test(t) && !/\b(yes|confirm|go ahead|do it)\b/i.test(t)) return false;
+  return CONFIRM_RE.test(t);
+}
+
+// C1 FIX (was self-gatable): a destructive/outbound tool no longer executes on a
+// model-supplied `confirm:true` — the model could set that itself with no real
+// approval. Confirmation must be the OWNER'S ACTUAL last inbound being a yes. The
+// model cannot forge the owner's message, so it can only get here after genuinely
+// asking and the owner genuinely confirming. The model's confirm field is ignored.
+// (_confirmed is reserved for a future server-set deterministic execute path.)
+export function isDestructive(name: string): boolean {
+  return DESTRUCTIVE.has(name);
+}
+
+function destructiveGate(name: string, input: any, lastUser: string): { ok: boolean; error?: string } | null {
   if (!DESTRUCTIVE.has(name)) return null;
-  const confirmed = input?.confirm === true || input?._confirmed === true;
-  if (confirmed) return null;
+  const serverConfirmed = input?._confirmed === true; // server-set only, never the model
+  const ownerConfirmed = isConfirmation(lastUser);
+  if (serverConfirmed || ownerConfirmed) return null;
   return {
     ok: false,
     error:
-      `Destructive tool '${name}' refused without explicit confirmation. ` +
+      `Destructive tool '${name}' refused: the owner has not confirmed. ` +
       `JENSEN-DOCTRINE Law 8: write tools never run inline. ` +
-      `Ask the user a clear yes/no confirmation ('Delete X? Reply yes to confirm'), wait for their answer, then retry this tool with confirm:true.`,
+      `Ask a clear yes/no ('Delete X? Reply yes to confirm') and wait. The action ` +
+      `runs only when the owner's own next message is a yes (a confirm:true flag is ignored).`,
   };
 }
 
@@ -263,9 +288,9 @@ const GEN_SYS = (kind: string) =>
 const LEGAL_SYS = (kind: string, blueprint: string) =>
   `You are Rencontre, drafting a UAE ${kind} for Jensen / La Rencontre. Ground it in this legal blueprint where relevant:\n${blueprint || "(no blueprint saved yet; use sensible UAE defaults and flag where Jensen must fill specifics)"}\nDraft a clear, professional document under Dubai/UAE law. Add a short note that a UAE lawyer should review before signing. ${NO_DASHES} Output the document body only.`;
 
-export async function runAction(name: string, input: any, ctx?: { party?: string }): Promise<{ ok: boolean; result?: Result; error?: string }> {
+export async function runAction(name: string, input: any, ctx?: { party?: string; lastUser?: string }): Promise<{ ok: boolean; result?: Result; error?: string }> {
   try {
-    const gated = destructiveGate(name, input);
+    const gated = destructiveGate(name, input, ctx?.lastUser || "");
     if (gated) return gated;
     let result: Result;
     switch (name) {

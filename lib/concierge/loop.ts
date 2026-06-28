@@ -5,7 +5,7 @@
 import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
 import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
-import { runAction } from "./dispatch";
+import { runAction, isDestructive } from "./dispatch";
 import { honestReply } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
 import { recall, captureSalience, listDirectives } from "./brain";
@@ -281,6 +281,11 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   const convo: Turn[] = history.map((m) => ({ role: m.role, content: m.content }));
   const runs: { name: string; ok: boolean; result?: any }[] = [];
   let reply = "";
+  // Skeptic #1/#2/#5: a single owner "yes" must not unlock a BATCH of destructive
+  // actions. At most ONE destructive tool executes per turn; a 2nd is refused and
+  // the owner is asked to confirm each separately. (Per-action binding via
+  // pending_actions is the full Law-8 fix; this is the turn-level stopgap.)
+  let destructiveUsedThisTurn = 0;
 
   if (onboarding) {
     // Listen-only: one conversational turn, tools disabled, nothing executed.
@@ -313,7 +318,17 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
       convo.push({ role: "assistant", content: blocks });
       const toolResults: any[] = [];
       for (const tu of toolUses) {
-        const r = await runAction(tu.name, tu.input || {}, { party });
+        // One destructive action per turn (skeptic #1/#2/#5).
+        if (isDestructive(tu.name)) {
+          if (destructiveUsedThisTurn >= 1) {
+            const refusal = { name: tu.name, ok: false, result: { summary: "I can only do one delete or send at a time. Tell me which one and confirm it, then I will do the next." } };
+            runs.push(refusal);
+            toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: JSON.stringify({ error: refusal.result.summary }), is_error: true });
+            continue;
+          }
+          destructiveUsedThisTurn++;
+        }
+        const r = await runAction(tu.name, tu.input || {}, { party, lastUser });
         runs.push({ name: tu.name, ok: r.ok, result: r.ok ? r.result : { summary: r.error } });
         toolResults.push({
           type: "tool_result",
