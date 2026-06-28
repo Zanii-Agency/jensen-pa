@@ -183,6 +183,42 @@ export function normalizeEventTitleKey(title: string): string {
     .trim();
 }
 
+// Pure reconcile decision (Phase 2, unit-testable): the id of the SINGLE upcoming
+// event that shares this identity on a different date (the meeting being moved),
+// or null when there is no unambiguous single match (insert a fresh event instead
+// of blind-merging two distinct same-title meetings).
+// Generic identities that are NOT distinctive enough to assume "same meeting
+// moved" — two "Review"s on different days are usually different meetings. Only a
+// distinctive identity (a name/org: sotiris, karafotias, a2 milk) reconciles.
+const GENERIC_EVENT_KEYS = new Set([
+  "", "review", "call", "sync", "meeting", "catch up", "catchup", "standup",
+  "lunch", "dinner", "coffee", "chat", "check in", "checkin", "1 1", "one on one",
+]);
+
+export function pickReconcileTarget(
+  upcoming: { id: string; title: string; date: string; recurrence?: string | null; entity_id?: string | null }[],
+  key: string,
+  newDate: string,
+  newEntityId?: string | null,
+): string | null {
+  // Guard 1: a generic title is never reconciled (would move a distinct meeting).
+  if (GENERIC_EVENT_KEYS.has(key) || key.length < 4) return null;
+  const matches = (upcoming || []).filter(
+    (r) =>
+      normalizeEventTitleKey(r.title) === key &&
+      r.date !== newDate &&
+      // Guard 2 (skeptic F1, CRITICAL): never move a RECURRING anchor — a weekly
+      // meeting is a single upcoming row; reconciling it corrupts the whole series.
+      // A recurring meeting is moved via update_event, never via a new create.
+      !r.recurrence &&
+      // Guard 3 (skeptic F3, HIGH): if both carry an entity, they must be the SAME
+      // entity. Two distinct meetings with the same person (same title key) must not
+      // merge. Absent entity on either side falls back to title-identity only.
+      (!newEntityId || !r.entity_id || r.entity_id === newEntityId),
+  );
+  return matches.length === 1 ? matches[0].id : null;
+}
+
 export async function createEvent(i: { title: string; date: string; time?: string; entityId?: string; note?: string; recurrence?: string; recurrenceUntil?: string; meetingUrl?: string }) {
   // Soft-dedup: normalized title + same date (+ same time if both provided) is
   // the same event, not a copy. Prevents the 06-13 Karafotias case where the
@@ -197,6 +233,23 @@ export async function createEvent(i: { title: string; date: string; time?: strin
       return true;
     });
     if (dup) return { id: dup.id, title: dup.title, date: i.date, deduped: true };
+
+    // Cross-date identity reconcile (Phase 2 — kills the duplicate-meeting class,
+    // e.g. the 3 "Meeting with Sotiris" rows across 06-17/26/29). If EXACTLY ONE
+    // upcoming event shares this identity on a DIFFERENT date, a "new" create is
+    // that meeting being MOVED, not a copy: update it in place. Ambiguous (0 or
+    // 2+ matches) falls through to insert — we never blind-merge two distinct
+    // same-title meetings. Guards (skeptic-hardened): generic titles, RECURRING
+    // anchors, and differing-entity meetings are all excluded from reconcile.
+    const today = dubaiToday(); // skeptic F5: Dubai +4, not raw UTC (matches the rest of this file)
+    const upcoming = await sbSelect<any>("events", `date=gte.${enc(today)}&select=id,title,date,time,recurrence,entity_id&limit=50`).catch(() => []);
+    const targetId = pickReconcileTarget(upcoming as any[], key, i.date, i.entityId);
+    if (targetId) {
+      // Forward the fields the model supplied on THIS create (skeptic F2): a move
+      // that drops the new note/entity silently loses the operator's intent.
+      await updateEvent({ id: targetId, date: i.date, time: i.time, meetingUrl: i.meetingUrl, note: i.note, entityId: i.entityId });
+      return { id: targetId, title: i.title, date: i.date, reconciled: true };
+    }
   }
   const validRecurrence = ["weekly", "monthly", "yearly"].includes(i.recurrence || "") ? i.recurrence : null;
   const row: any = { id: uid(), title: i.title, date: i.date, time: i.time ?? null, entity_id: i.entityId ?? null, note: i.note ?? null, recurrence: validRecurrence, recurrence_until: i.recurrenceUntil ?? null, created_at: now() };
@@ -207,6 +260,9 @@ export async function createEvent(i: { title: string; date: string; time?: strin
 export async function updateEvent(i: any) {
   const patch: any = {};
   for (const k of ["title", "date", "time", "note", "recurrence", "recurrence_until"]) if (i[k] !== undefined) patch[k] = i[k];
+  // entityId maps to entity_id (the loop above uses snake_case keys; the camelCase
+  // entityId the model/reconcile passes was previously dropped on update).
+  if (i.entityId !== undefined) patch.entity_id = i.entityId;
   // Meeting link maps to the meeting_url column (only when provided, never clobbered to null).
   if (i.meetingUrl) patch.meeting_url = i.meetingUrl;
   // Wall-at-primitive: any change to fire-time invalidates the reminder latch.
