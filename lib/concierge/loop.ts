@@ -4,6 +4,7 @@
 
 import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
+import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
 import { runAction } from "./dispatch";
 import { honestReply } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
@@ -224,6 +225,21 @@ async function callRaw(system: string | { head: string; tail: string }, messages
 
 export type ConciergeResult = { reply: string; toolsUsed: string[] };
 
+// Mesh routing telemetry — the live deploy discriminator (queryable system row,
+// never enters brain history). Best-effort: observability must never block a turn.
+async function emitRoute(party: string, domain: Domain, reason: string, scoped: number, full: number): Promise<void> {
+  try {
+    const { admin } = await import("@/lib/db");
+    await admin().from("chat_messages").insert({
+      role: "system",
+      content: `route: ${JSON.stringify({ domain, reason, tools: scoped, of: full, party })}`.slice(0, 400),
+      channel: "route",
+      party: "system",
+      ts: Date.now(),
+    });
+  } catch { /* best-effort; routing must never fail a turn */ }
+}
+
 export async function runConcierge(input: { messages: { role: "user" | "assistant"; content: string }[]; channel?: string; sender?: Sender; swipeAnchor?: { quotedExcerpt: string } | null }): Promise<ConciergeResult> {
   const history = input.messages.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-16);
   const lastUser = [...history].reverse().find((m) => m.role === "user")?.content || "";
@@ -245,7 +261,22 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // Jensen; his messages and memory never mix into Jensen's, and only the admin
   // toolset can read Jensen's chats (one-way).
   const party = (input.sender?.role ?? "owner") !== "owner" ? "taona" : "jensen";
-  const toolset = (input.sender?.role ?? "owner") !== "owner" ? TOOLS : TOOLS.filter((t) => !ADMIN_ONLY.has(t.name));
+  const toolset0 = (input.sender?.role ?? "owner") !== "owner" ? TOOLS : TOOLS.filter((t) => !ADMIN_ONLY.has(t.name));
+
+  // MESH ROUTER (Phase 3 — de-monolith). Scope the toolset to the routed domain so
+  // a single-intent turn sees ~12-18 tools, not 62. general (ambiguous/multi) keeps
+  // the full set => never worse than today. Focus line tells the lane its job.
+  const route = routeDomain(lastUser);
+  const scopedNames = new Set(scopeToolNames(route.domain, toolset0.map((t) => t.name)));
+  const toolset = toolset0.filter((t) => scopedNames.has(t.name));
+  const focus = focusBlock(route.domain);
+  const routedSystem = !focus
+    ? system
+    : typeof system === "string"
+      ? `${system}\n\n${focus}`
+      : { head: system.head, tail: `${system.tail}\n\n${focus}` };
+  // Observability (fire-and-forget): the live discriminator for the mesh deploy.
+  void emitRoute(party, route.domain, route.reason, toolset.length, toolset0.length);
 
   const convo: Turn[] = history.map((m) => ({ role: m.role, content: m.content }));
   const runs: { name: string; ok: boolean; result?: any }[] = [];
@@ -272,7 +303,7 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
     reply = formatUpdatedList({ tasks, events, today, name: input.sender?.name || "Jensen" });
   } else {
     for (let i = 0; i < 6; i++) {
-      const data = await callRaw(system, convo, 1800, true, toolset);
+      const data = await callRaw(routedSystem, convo, 1800, true, toolset);
       const blocks: any[] = data.content || [];
       const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
       const toolUses = blocks.filter((b) => b.type === "tool_use");
