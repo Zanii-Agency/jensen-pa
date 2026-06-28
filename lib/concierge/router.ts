@@ -14,41 +14,46 @@ export type Domain = "calendar" | "tasks" | "docs" | "comms" | "money" | "genera
 
 // Tools every specialist always gets — the "search before asking" trio + light
 // lookups the model reaches for in any lane. Keeps a scoped lane from starving.
-// Skeptic-widened: these are needed in EVERY lane (that is the definition of
-// cross-cutting). Contact lookup/add (to email/invite anyone), calendar context
-// (to write truthful replies), and the standing-memory + note tools (a "from now
-// on..." or "note that..." fires in any lane and must never be dropped).
+// Trimmed to the TRUE cross-lane core (audit: 13 was over-stuffing every lane).
+// Each of these is genuinely reached for in any lane: resolve a person, recall a
+// fact, check the calendar for truthful context, read settings, capture a standing
+// instruction or a passing note (losing a "note that X" is data-loss, so add_note
+// stays here on the never-worse rule). Everything else moved to the lane(s) that
+// actually use it; `general` (full toolset) still exposes all of them on ambiguity.
 const CROSS_CUTTING = [
-  "find_contact", "list_contacts", "add_contact", "find_entity", "list_entities",
-  "query_memory", "remember_fact", "remember_preference", "search_documents",
-  "list_notes", "add_note", "query_calendar", "get_settings",
+  "find_contact", "query_memory", "query_calendar", "get_settings",
+  "remember_preference", "add_note",
 ];
 
 // Per-domain tool manifests (generous on purpose: a lane includes the adjacent
 // tools its work naturally spills into, e.g. calendar can create a task).
 const MANIFEST: Record<Exclude<Domain, "general">, string[]> = {
   calendar: [
-    "query_calendar", "day_log", "create_event", "update_event", "delete_event",
+    "day_log", "create_event", "update_event", "delete_event",
     "complete_event", "accept_meeting_tasks", "send_meeting_invite", "create_task",
+    "add_contact", // invite/attach a new person to a meeting
   ],
   tasks: [
     "list_tasks", "create_task", "update_task", "complete_task", "delete_task",
-    "accept_meeting_tasks", "morning_brief",
+    "accept_meeting_tasks", "morning_brief", "list_notes",
   ],
   docs: [
     "send_filed_document", "list_documents", "file_document", "delete_document",
     "generate_document", "generate_legal", "set_legal_blueprint",
     "sanad_draft_contract", "sanad_review_contract",
     "send_email", "draft_reply", // docs work routinely ends in "email this out"
+    "search_documents", "find_entity", // docs is the home of doc search + entity tie
   ],
   comms: [
     "list_inbox", "read_email", "search_email", "reply_email", "draft_reply",
     "send_email", "send_meeting_invite", "call_owner",
+    "add_contact", "search_documents", // email a new person; answer a mail about a doc
   ],
   money: [
     "finance_summary", "list_finance", "record_finance", "update_finance",
     "delete_finance", "vat_report", "ct_estimate",
     "send_email", "generate_document", "send_filed_document", // "send them the receipt/invoice"
+    "find_entity", // tie finance to a client/venue
   ],
 };
 

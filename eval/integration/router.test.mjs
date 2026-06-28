@@ -81,18 +81,31 @@ test("5c: 'what did I spend on the Sohum event' routes to money, NOT a toolless 
   assert.ok(scopeToolNames("money", ALL).includes("finance_summary"));
 });
 
-test("4: a 'from now on...' preference is never dropped in a scoped lane", () => {
-  // calendar turn that also sets a standing preference
-  const scoped = scopeToolNames("calendar", ALL);
-  assert.ok(scoped.includes("remember_preference"), "remember_preference is cross-cutting");
-  assert.ok(scoped.includes("add_note"), "add_note is cross-cutting");
+test("4: a 'from now on...' preference + a passing note are never dropped in any lane", () => {
+  // remember_preference and add_note stay cross-cutting (data-loss if dropped).
+  for (const d of ["calendar", "tasks", "docs", "comms", "money"]) {
+    const s = scopeToolNames(d, ALL);
+    assert.ok(s.includes("remember_preference"), `${d}: remember_preference cross-cutting`);
+    assert.ok(s.includes("add_note"), `${d}: add_note cross-cutting`);
+  }
 });
 
-test("1a: any lane can look up + add a contact to email/invite a person", () => {
-  for (const d of ["calendar", "comms", "docs", "money"]) {
+test("1a: lanes that email/invite a person can resolve + add a contact", () => {
+  // find_contact is cross-cutting (every lane); add_contact only where you email/invite.
+  for (const d of ["calendar", "comms"]) {
     const s = scopeToolNames(d, ALL);
-    assert.ok(s.includes("find_contact") && s.includes("list_contacts") && s.includes("add_contact"), `${d} can resolve a contact`);
+    assert.ok(s.includes("find_contact") && s.includes("add_contact"), `${d} can resolve + add a contact`);
   }
+  // tasks/money do NOT carry add_contact (trim: noise there).
+  assert.ok(!scopeToolNames("tasks", ALL).includes("add_contact"), "tasks does not carry add_contact");
+});
+
+test("trim: calendar lane is lean (~14, not 21) but keeps its job tools", () => {
+  const s = scopeToolNames("calendar", ALL);
+  assert.ok(s.includes("create_event") && s.includes("query_calendar") && s.includes("send_meeting_invite"));
+  assert.ok(!s.includes("search_documents"), "calendar dropped the doc-search passenger");
+  assert.ok(!s.includes("list_entities"), "calendar dropped the entity-list passenger");
+  assert.ok(s.length <= 15, `calendar lane trimmed (got ${s.length})`);
 });
 
 test("1b/1e: docs and money lanes can send their output (no send-starve)", () => {
