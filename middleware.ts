@@ -4,7 +4,9 @@ import { COOKIE, verifyToken } from "@/lib/auth";
 // External webhooks have their own auth (HMAC / verify-token / agent secret) and
 // must always reach their handlers, even during maintenance. /api/whatsapp has
 // the JENSEN_MODE allowlist gate inside route.ts.
-const EXTERNAL = ["/api/whatsapp", "/api/cron", "/api/shopify/webhook", "/api/ingest", "/api/digital-u", "/api/mute"];
+// /api/actions is the ChatGPT connector: bearer-gated in its own handler (a cookie
+// session can never satisfy a bearer client), so it must bypass the cookie/maintenance wall.
+const EXTERNAL = ["/api/whatsapp", "/api/cron", "/api/shopify/webhook", "/api/ingest", "/api/digital-u", "/api/mute", "/api/actions"];
 
 // The session-login flow's own routes — public for the auth gate, but during
 // maintenance they are also walled (don't let anyone log in while we are dark).
