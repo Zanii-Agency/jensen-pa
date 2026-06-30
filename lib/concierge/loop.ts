@@ -6,7 +6,7 @@ import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
 import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
 import { runAction, isDestructive } from "./dispatch";
-import { honestReply } from "./honest-reply";
+import { honestReply, isUnbackedClaim } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
 import { recall, captureSalience, listDirectives } from "./brain";
 import * as ops from "./ops";
@@ -182,7 +182,7 @@ Default to Q2 when unclear. When calling create_task, ALWAYS pass the quadrant y
 
 type OnChunk = (text: string) => void;
 
-async function callRaw(system: string | { head: string; tail: string }, messages: Turn[], maxTokens = 1800, withTools = true, tools: any[] = TOOLS, onChunk?: OnChunk) {
+async function callRaw(system: string | { head: string; tail: string }, messages: Turn[], maxTokens = 1800, withTools = true, tools: any[] = TOOLS, onChunk?: OnChunk, toolChoice?: any) {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) throw new Error("ANTHROPIC_API_KEY not set");
   const systemBlocks =
@@ -200,6 +200,7 @@ async function callRaw(system: string | { head: string; tail: string }, messages
     messages,
   };
   if (withTools) body.tools = tools.map((t, i) => (i === tools.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t));
+  if (withTools && toolChoice) body.tool_choice = toolChoice;
   const startedAt = Date.now();
   const res = await fetch(API, {
     method: "POST",
@@ -307,13 +308,34 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
     ]);
     reply = formatUpdatedList({ tasks, events, today, name: input.sender?.name || "Jensen" });
   } else {
-    for (let i = 0; i < 6; i++) {
-      const data = await callRaw(routedSystem, convo, 1800, true, toolset);
+    // SELF-REPAIR state (KT #206540, Mode 1). `forcedRepair` ensures the forced
+    // round runs AT MOST once per turn; `nextForceTool` flags the next callRaw to
+    // force tool use. Loop bound bumped 6 -> 7 to leave room for the repair round.
+    let forcedRepair = false;
+    let nextForceTool = false;
+    for (let i = 0; i < 7; i++) {
+      const choice = nextForceTool ? { type: "any" } : undefined;
+      nextForceTool = false;
+      const data = await callRaw(routedSystem, convo, 1800, true, toolset, undefined, choice);
       const blocks: any[] = data.content || [];
       const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
       const toolUses = blocks.filter((b) => b.type === "tool_use");
       if (text) reply = text;
-      if (data.stop_reason !== "tool_use" || toolUses.length === 0) break;
+      if (data.stop_reason !== "tool_use" || toolUses.length === 0) {
+        // The model narrated a finished action but called no tool, so nothing
+        // happened and the rail can only emit the dead "I have not done that yet"
+        // stub. Give it ONE forced-tool round so the clear command actually runs.
+        // This fires ONLY on that already-broken path; a normal turn is untouched.
+        if (!forcedRepair && isUnbackedClaim(reply, runs, lastUser)) {
+          forcedRepair = true;
+          nextForceTool = true;
+          void emitRoute(party, route.domain, "self_repair_forced_tool", toolset.length, toolset0.length);
+          convo.push({ role: "assistant", content: blocks.length ? blocks : [{ type: "text", text: reply }] });
+          convo.push({ role: "user", content: [{ type: "text", text: "You replied as if that was done, but you called no tool, so nothing actually happened on the system. Call the correct tool now to actually perform it. If a detail is missing or it is ambiguous, say exactly what you need instead of claiming it is done." }] });
+          continue;
+        }
+        break;
+      }
 
       convo.push({ role: "assistant", content: blocks });
       const toolResults: any[] = [];

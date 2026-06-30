@@ -58,6 +58,28 @@ function rewriteToHonest(runs: ToolRun[]): string {
 }
 
 /**
+ * True iff honestReply would rewrite this to the BARE "I have not done that yet"
+ * stub: a finished-action claim with NO backing tool success AND no useful
+ * failing-tool message to surface instead. This is exactly Mode 1 of the
+ * model-reliability gap (KT #206540): the model narrated a completed action but
+ * called no tool, so nothing happened. The loop uses this to fire ONE forced-tool
+ * self-repair round so the clear command actually executes. It deliberately
+ * returns false when a tool DID run (Mode 2 — wrong specifics — is a different
+ * fix) and when a failing tool already carries a useful disambiguation message.
+ */
+export function isUnbackedClaim(reply: string, runs: ToolRun[], userAsk = ""): boolean {
+  const text = (reply || "").trim();
+  if (!text) return false; // empty -> honest fallback, not the stub
+  if (runs.some((r) => REPORT_TOOLS.has(r.name))) return false;
+  if (READ_ASK.test(userAsk)) return false;
+  if (!CLAIM.test(text) || NOT_A_CLAIM.test(text)) return false;
+  const backed = SENT_CLAIM.test(text) ? okIn(runs, SEND_TOOLS) : okIn(runs, COMPLETION_TOOLS);
+  if (backed) return false; // a tool ran (Mode 2 is handled elsewhere)
+  if (failingToolMessage(runs)) return false; // a useful failure message exists; surface that
+  return true;
+}
+
+/**
  * Returns the reply that should actually ship.
  * - Empty reply never becomes "Done." It becomes something true.
  * - A finished-action claim with no backing tool success is rewritten to the truth.
