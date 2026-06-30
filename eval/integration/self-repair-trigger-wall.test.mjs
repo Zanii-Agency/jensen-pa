@@ -15,7 +15,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isUnbackedClaim } from "../../lib/concierge/honest-reply.ts";
+import { isUnbackedClaim, honestReply } from "../../lib/concierge/honest-reply.ts";
 
 const NO_RUNS = [];
 const okEvent = [{ name: "create_event", ok: true, result: { title: "x" } }];
@@ -47,4 +47,24 @@ test("DOES NOT FIRE: empty reply (handled by a different honest fallback)", () =
 
 test("DOES NOT FIRE: a recap/summary answer with past-tense verbs (KT #334 over-fire guard)", () => {
   assert.equal(isUnbackedClaim("Earlier you saved two vendors and set the Talal meeting.", NO_RUNS, "summarise my day"), false);
+});
+
+// FALSE-NEGATIVE FIX (2026-06-30, live to Jensen): a SUCCESSFUL create_event whose
+// reply mentions the reminder with a send-ish verb ("notified"/"sent") was being
+// rewritten to "I have not done that yet" though the event row existed. A real
+// success must never be reported as a failure. isBacked() now treats any
+// completion-tool success as backing, regardless of incidental send words.
+test("DOES NOT FIRE: successful create + send-word reply is backed, not a trigger", () => {
+  assert.equal(isUnbackedClaim("Saved your meeting with Taona and Margot at 10:00. I have notified your reminder to include the link.", okEvent, "save the link"), false);
+  assert.equal(isUnbackedClaim("Done, the meeting is saved and I have sent it to your reminder.", okEvent, "save the link"), false);
+});
+
+test("honestReply ships a successful create even when the reply uses a send-word (no stub)", async () => {
+  const out = await honestReply("Done. Saved the meeting with Taona and Margot and notified your reminder to carry the link.", okEvent, "save the link");
+  assert.equal(out.startsWith("I have not done that yet"), false);
+});
+
+test("honestReply STILL stubs a pure sent-claim with no send tool (guard intact)", async () => {
+  const out = await honestReply("Done, I emailed Khalid the new time.", NO_RUNS, "email khalid the new time");
+  assert.equal(out.startsWith("I have not done that yet"), true);
 });

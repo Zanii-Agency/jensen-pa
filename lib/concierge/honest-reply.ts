@@ -36,6 +36,26 @@ const READ_ASK =
 const okIn = (runs: ToolRun[], names: Set<string>) =>
   runs.some((r) => names.has(r.name) && r.ok);
 
+// Is the reply backed by a real action this turn?
+//
+// A successful COMPLETION tool ALWAYS backs the reply: a genuine write happened,
+// so the reply is not a lie even if it incidentally mentions a future "reminder"
+// or uses a send-ish verb about it. Only a PURE sent-claim with no completion
+// success falls back to requiring an actual send tool.
+//
+// Bug it fixes (2026-06-30, live to Jensen): "Saved your meeting with Taona and
+// Margot... I have notified your reminder to include the link" got rewritten to
+// "I have not done that yet" even though create_event had SUCCEEDED (event row
+// existed). The word "notified" routed the check to SEND_TOOLS only, ignoring
+// the backing create_event. A real success must never be called a failure.
+// Fabrication while backed (e.g. claims an email that never sent) is still caught
+// by the LLM secondary net in honestReply.
+function isBacked(text: string, runs: ToolRun[]): boolean {
+  if (okIn(runs, COMPLETION_TOOLS)) return true;
+  if (SENT_CLAIM.test(text)) return okIn(runs, SEND_TOOLS);
+  return false;
+}
+
 // A completion-class tool that RAN, failed, and carries a real message (a reason
 // or a disambiguation question). That message is the honest, useful answer.
 function failingToolMessage(runs: ToolRun[]): string | null {
@@ -73,8 +93,7 @@ export function isUnbackedClaim(reply: string, runs: ToolRun[], userAsk = ""): b
   if (runs.some((r) => REPORT_TOOLS.has(r.name))) return false;
   if (READ_ASK.test(userAsk)) return false;
   if (!CLAIM.test(text) || NOT_A_CLAIM.test(text)) return false;
-  const backed = SENT_CLAIM.test(text) ? okIn(runs, SEND_TOOLS) : okIn(runs, COMPLETION_TOOLS);
-  if (backed) return false; // a tool ran (Mode 2 is handled elsewhere)
+  if (isBacked(text, runs)) return false; // a real action backs it (Mode 2 handled elsewhere)
   if (failingToolMessage(runs)) return false; // a useful failure message exists; surface that
   return true;
 }
@@ -97,11 +116,7 @@ export async function honestReply(reply: string, runs: ToolRun[], userAsk = ""):
   if (READ_ASK.test(userAsk)) return text;
   if (!CLAIM.test(text) || NOT_A_CLAIM.test(text)) return text;
 
-  const backed = SENT_CLAIM.test(text)
-    ? okIn(runs, SEND_TOOLS)
-    : okIn(runs, COMPLETION_TOOLS);
-
-  if (!backed) return rewriteToHonest(runs); // definite fake, deterministic, cannot fail open
+  if (!isBacked(text, runs)) return rewriteToHonest(runs); // definite fake, deterministic, cannot fail open
 
   // Backed claim. Secondary net for subtle mismatches the regex missed.
   // If this check itself errors, the backed claim stands (safe failure).
