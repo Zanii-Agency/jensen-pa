@@ -19,7 +19,7 @@ const SENT_CLAIM = /\b(sent|messaged|emailed|notified|told|forwarded)\b/i;
 // Tool names whose ok=true backs a "sent/emailed/notified" claim. Jensen has no
 // generic "send" tool (his WhatsApp reply IS the message); the only outbound
 // tools are reply_email (sends an email) and call_owner (places a call).
-const SEND_TOOLS = new Set<string>(["reply_email", "call_owner"]);
+const SEND_TOOLS = new Set<string>(["reply_email", "call_owner", "send_task_to_peer"]);
 // Tools that REPORT existing records (a day's activity, the morning brief). Their
 // replies are full of historical completion language ("vendors saved", "meeting
 // set") that describes the PAST, not a fresh action this turn. The claim-rewrite

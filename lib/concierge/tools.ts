@@ -20,6 +20,7 @@ export const TOOLS: Tool[] = [
   { name: "list_tasks", description: "List tasks. Quadrant 1=urgent+important,2=important,3=urgent-only,4=noise. CRITICAL: the 'done' filter defaults to no filter (all states). If you query done=false and get empty, that ONLY means 'no open tasks matched'; it does NOT mean the task doesn't exist. Before claiming a task 'isn't in the system' or 'doesn't exist', re-query without the done filter to confirm absence.", input_schema: obj({ quadrant: num("1-4"), entityId: str(""), done: bool("") }) },
   { name: "create_task", description: "Add a task to the Covey board. DERIVE QUADRANT from what Jensen says: 'urgent' / 'ASAP' / 'today' / 'deadline' / 'time sensitive' = Q1 (1). 'Important' / 'when you get a chance' / 'protect' / 'this week' = Q2 (2). 'Quick favor' / 'can you handle this' / 'delegate' = Q3 (3). 'FYI' / 'just so you know' / 'don't worry about it' = Q4 (4). Default to Q2 if unclear.", input_schema: obj({ title: str("task"), quadrant: num("1-4: Q1=urgent+important, Q2=important, Q3=urgent-only, Q4=noise. Derive from how Jensen describes it."), entityId: str("link to entity"), due: str("YYYY-MM-DD") }, ["title"]) },
   { name: "update_task", description: "Update a task (title/quadrant/due/done).", input_schema: obj({ id: str(""), title: str(""), quadrant: num(""), due: str(""), done: bool("") }, ["id"]) },
+  { name: "send_task_to_peer", description: "Send a task to Taona's own assistant bot. Use ONLY when Jensen EXPLICITLY tells you to send/assign/forward/delegate a task TO TAONA (e.g. 'send this to Taona', 'assign Taona', 'put this on Taona's list', 'forward that to Taona'). NEVER use it just because a task mentions Taona's name: 'meeting with Taona' or 'review the contract with Taona' is NOT a send, do not call this for those. Only the task title and due date reach Taona, nothing else. Also saves the task on Jensen's own board.", input_schema: obj({ title: str("the task text to send to Taona"), due: str("YYYY-MM-DD if Jensen gave a due date, else omit") }, ["title"]) },
   { name: "complete_task", description: "Mark a task done.", input_schema: obj({ id: str("") }, ["id"]) },
   { name: "delete_task", description: "Delete a task. DESTRUCTIVE: ask the user to confirm in conversation first, then call again with confirm:true. Never combine with create_task in one turn from a compound 'add X and delete Y' command.", input_schema: obj({ id: str(""), confirm: bool("must be true; only set after user explicitly confirms the deletion") }, ["id"]) },
 
@@ -145,6 +146,7 @@ export const COMPLETION_TOOLS = new Set([
   // Keeping them out of COMPLETION_TOOLS lets the honesty rail rewrite any such
   // claim to the truth. file_document (a real save) stays.
   "file_document", "delete_document", "set_legal_blueprint",
+  "send_task_to_peer",
   "add_contact", "update_contact", "delete_contact", "add_note", "delete_note", "remember_fact",
   "remember_preference", "forget_memory", "update_prefs", "set_goals", "reply_email",
 ]);

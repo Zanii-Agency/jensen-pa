@@ -36,6 +36,7 @@ const MANIFEST: Record<Exclude<Domain, "general">, string[]> = {
   tasks: [
     "list_tasks", "create_task", "update_task", "complete_task", "delete_task",
     "accept_meeting_tasks", "morning_brief", "list_notes",
+    "send_task_to_peer", // delegate a task to Taona's bot (ADR-0015)
   ],
   docs: [
     "send_filed_document", "list_documents", "file_document", "delete_document",

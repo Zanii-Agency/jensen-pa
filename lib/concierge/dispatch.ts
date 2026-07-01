@@ -315,6 +315,23 @@ export async function runAction(name: string, input: any, ctx?: { party?: string
         }
         break;
       }
+      case "send_task_to_peer": {
+        // ADR-0015 cross-bot delegate. Record on Jensen's board (the id is the
+        // correlation key for status-backs), then push ONLY the allowlisted fields
+        // to Taona's bot. Honest: if the bridge is off or unreachable, we say so
+        // and never claim it reached Taona (the honesty rail surfaces the summary).
+        const { peerSyncEnabled, toPeerPayload, sendTaskToPeer } = await import("@/lib/peer-sync");
+        const created: any = await ops.createTask({ title: String(input.title || ""), due: input.due, quadrant: 3 });
+        const correlationId = created?.id;
+        if (!peerSyncEnabled() || !correlationId) {
+          return { ok: false, error: `Saved *${input.title}* to your board. Sending tasks to Taona is not switched on yet, so it did not go to him.` };
+        }
+        const r = await sendTaskToPeer(toPeerPayload({ title: String(input.title || ""), due: input.due ?? null, status: "open", correlationId }));
+        if (r.skipped) return { ok: false, error: `Saved *${input.title}* to your board. The link to Taona's bot is not configured yet, so it did not go to him.` };
+        if (!r.ok) return { ok: false, error: `Saved *${input.title}* to your board, but I could not reach Taona's bot just now, so I have not sent it to him. I will not say it reached him.` };
+        result = { ok: true, sent_to: "Taona", title: String(input.title || ""), correlation_id: correlationId } as any;
+        break;
+      }
       case "update_task": {
         // Wall 2: look up the resolved title BEFORE writing so we can refuse
         // when the operator's last inbound names a different team contact.
