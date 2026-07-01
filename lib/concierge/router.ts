@@ -23,6 +23,11 @@ export type Domain = "calendar" | "tasks" | "docs" | "comms" | "money" | "genera
 const CROSS_CUTTING = [
   "find_contact", "query_memory", "query_calendar", "get_settings",
   "remember_preference", "add_note",
+  // NOTE (KT #206597): remember_fact + entity_dashboard were considered for
+  // cross-cutting but deliberately left general-only to keep lanes lean. The bare
+  // "remember X" / "what's going on with X" phrasings route to general (which has
+  // them), and add_note (cross-cutting) captures a "remember" that lands in a
+  // scoped lane, so leaving them out degrades gracefully rather than starving.
 ];
 
 // Per-domain tool manifests (generous on purpose: a lane includes the adjacent
@@ -44,17 +49,21 @@ const MANIFEST: Record<Exclude<Domain, "general">, string[]> = {
     "sanad_draft_contract", "sanad_review_contract",
     "send_email", "draft_reply", // docs work routinely ends in "email this out"
     "search_documents", "find_entity", // docs is the home of doc search + entity tie
+    "add_contact", // "add Khalid to his file" spills into contact-create
   ],
   comms: [
     "list_inbox", "read_email", "search_email", "reply_email", "draft_reply",
     "send_email", "send_meeting_invite", "call_owner",
     "add_contact", "search_documents", // email a new person; answer a mail about a doc
+    "send_task_to_peer", // "forward/email this to Taona" routes here, not tasks (KT #206597)
   ],
   money: [
     "finance_summary", "list_finance", "record_finance", "update_finance",
     "delete_finance", "vat_report", "ct_estimate",
     "send_email", "generate_document", "send_filed_document", // "send them the receipt/invoice"
     "find_entity", // tie finance to a client/venue
+    "add_contact", // "invoice Khalid, add his number"
+    "store_summary", // "revenue on orders" = Shopify (Law 7 canonical), not just finance rows
   ],
 };
 
