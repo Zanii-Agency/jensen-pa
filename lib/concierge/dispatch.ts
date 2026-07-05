@@ -12,6 +12,17 @@ import { aggregateInbox, readUnified, sendUnified, unpackId, sendMeetingInviteEm
 import { dubaiLocalToUtc } from "../ics";
 import { searchDocsWithClaude } from "../docs-server";
 import { enrichDraftContext } from "../mail-draft-context";
+
+// Zanii proof-of-action: every tool EXCEPT pure reads emits a receipt under its
+// own name (target = the tool). Deny-list (not allow-list) so new action tools
+// are covered by default; only reads/queries/computations are excluded.
+const ZANII_READS = new Set([
+  "list_contacts", "list_documents", "list_entities", "list_finance", "list_inbox",
+  "list_memory", "list_notes", "list_tasks", "query_calendar", "query_memory",
+  "find_contact", "find_entity", "read_email", "read_owner_chats", "search_documents",
+  "search_email", "get_settings", "entity_dashboard", "finance_summary", "morning_brief",
+  "vat_report", "ct_estimate",
+]);
 import { kvGet } from "../db";
 import { sbSelect, enc } from "./rest";
 import { sendWhatsAppDocument, devPhone, whoIs } from "../whatsapp";
@@ -584,6 +595,16 @@ export async function runAction(name: string, input: any, ctx?: { party?: string
       case "sanad_draft_contract": { result = await ops.sanadStartDraft(input); break; }
       case "sanad_review_contract": { result = await ops.sanadReview(input); break; }
       default: return { ok: false, error: `unknown tool ${name}` };
+    }
+    // One door: every non-read tool emits its Zanii receipt here, by tool name.
+    // Payload is hashed (only a fingerprint hits the ledger). ok is earned from
+    // the tool's own result. Fire-and-forget (waitUntil keeps it alive on Vercel).
+    if (!ZANII_READS.has(name)) {
+      const actionOk = result?.ok !== false && result?.sent !== false;
+      // Dynamic import keeps the ESM-only @zanii/sdk out of dispatch's static
+      // graph (the eval loader flips to strict-ESM and breaks extensionless
+      // imports otherwise). Fire-and-forget; waitUntil inside keeps it alive.
+      import("../zanii").then(({ recordAction }) => recordAction(name, { input: input ?? {}, ok: actionOk })).catch(() => {});
     }
     return { ok: true, result };
   } catch (e: any) {
