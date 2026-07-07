@@ -23,6 +23,7 @@ export async function POST(req: NextRequest) {
     const db = (await req.json()) as DB;
     if (!db || !Array.isArray(db.tasks)) return NextResponse.json({ error: "invalid state" }, { status: 400 });
     await replaceState(db);
+    import("@/lib/zanii").then(({ recordAction }) => recordAction("state.replace", { tasks: Array.isArray(db.tasks) ? db.tasks.length : 0, via: "portal" })).catch(() => {});
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || String(e) }, { status: 500 });

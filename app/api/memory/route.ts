@@ -16,6 +16,7 @@ export async function DELETE(req: NextRequest) {
     const id = new URL(req.url).searchParams.get("id");
     if (!id) return NextResponse.json({ error: "id required" }, { status: 400 });
     await forgetMemory(id);
+    import("@/lib/zanii").then(({ recordAction }) => recordAction("memory.forget", { id, via: "portal" })).catch(() => {});
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || String(e) }, { status: 500 });
