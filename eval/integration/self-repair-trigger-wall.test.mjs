@@ -15,7 +15,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isUnbackedClaim, honestReply } from "../../lib/concierge/honest-reply.ts";
+import { isUnbackedClaim, honestReply, isReadIntent } from "../../lib/concierge/honest-reply.ts";
 
 const NO_RUNS = [];
 const okEvent = [{ name: "create_event", ok: true, result: { title: "x" } }];
@@ -67,4 +67,53 @@ test("honestReply ships a successful create even when the reply uses a send-word
 test("honestReply STILL stubs a pure sent-claim with no send tool (guard intact)", async () => {
   const out = await honestReply("Done, I emailed Khalid the new time.", NO_RUNS, "email khalid the new time");
   assert.equal(out.startsWith("I have not done that yet"), true);
+});
+
+// READ-INTENT WALL (live incident, 2026-07-21). When Jensen asks to SEE his state
+// ("give me my updated list", "what are my meetings tomorrow"), a reply with
+// past-tense verbs ("set", "booked", "on the calendar") describes EXISTING records,
+// not a fresh action this turn. Two harms this pins shut:
+//   (a) honestReply rewrote such reads to the dead "I have not done that yet" stub
+//       ("what are my meetings tomorrow?" -> hollow, 07-15).
+//   (b) isUnbackedClaim=true fired the loop's self-repair force-tool on a READ,
+//       which made the model INVENT a create_event ("Meeting with Malik is now on
+//       the calendar") that Jensen never asked for (08:36, 07-21).
+// A read ask must NEVER trigger either. An ACTION ask still does.
+test("isReadIntent: recognises schedule/board reads, rejects action requests", () => {
+  for (const s of [
+    "what are my meetings tomorrow",
+    "what are my meeting and reminder for today",
+    "any reminders I had set for tomorrow",
+    "my tomorrow schedule",
+    "give me my updated list with all reminders",
+    "pull up my list",
+    "whats on today",
+  ]) assert.equal(isReadIntent(s), true, `should be a read: "${s}"`);
+
+  for (const s of [
+    "save the link",
+    "add contact",
+    "email khalid the new time",
+    "set a meeting today 6pm",
+    "6pm reminder to call malik",
+    "football at 8pm, dalia meeting at 12pm",   // bare event mention = create, not read
+    "delete the meeting",
+    // COMPOUND read + action: a strong action verb anywhere vetoes the read, so a
+    // fabricated "deleted" claim still reaches the rail (doctrine-review concern).
+    "show me my list and delete the top task",
+    "give me my updated list and add a task to call the bank",
+  ]) assert.equal(isReadIntent(s), false, `should be an action: "${s}"`);
+});
+
+test("DOES NOT FIRE self-repair on a READ ask (the phantom-Malik-event guard)", () => {
+  // The exact live shape: Jensen asked for his list, the model narrated a claim
+  // with no tool. This MUST NOT be treated as an unbacked action claim.
+  assert.equal(isUnbackedClaim("Done. Meeting with Malik is now on the calendar for today at 17:00.", NO_RUNS, "give me my updated list with all reminders"), false);
+  assert.equal(isUnbackedClaim("You have the Dalia meeting set for 12:00 and football booked at 20:00.", NO_RUNS, "what are my meetings tomorrow"), false);
+});
+
+test("honestReply does NOT stub a schedule read that mentions set/booked times", async () => {
+  const out = await honestReply("You have the Dalia meeting set for 12:00 and football booked at 20:00.", NO_RUNS, "what are my meetings tomorrow");
+  assert.equal(out.startsWith("I have not done that yet"), false);
+  assert.match(out, /Dalia/);
 });

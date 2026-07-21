@@ -20,6 +20,18 @@ test("isUpdatedListRequest fires on the operator's real phrasings", () => {
     "give me my list",
     "list",
     "show me the updated list please",
+    // The verbatim 07-21 phrasings that the tight matcher MISSED, so the request
+    // fell to the brain and looped hollow "Already in the system" / "I have not
+    // done that yet" replies. These are the operator's own words, they ARE the
+    // contract: every one must reach the deterministic board.
+    "Hello pull up my updated list with all reminders",
+    "Pull out my full updated list meaning with all upcoming reminders",
+    "what I mean I need my updated list which has all my task and upcmoning reminders",
+    "I want you to send me my updated list as in to do list with urgent not urgent etc and all upcoming events",
+    "I need my updated task list",
+    "updated task",
+    "give me the list",
+    "whats on the board",
   ]) {
     assert.equal(isUpdatedListRequest(s), true, `should match: "${s}"`);
   }
@@ -30,7 +42,9 @@ test("isUpdatedListRequest does NOT hijack compound or scoped commands", () => {
     "list tasks for Acme",
     "add milk to my list",
     "updated list and add a task to review the contract",
-    "send the list to John",
+    "send the list to John",            // sending the list to a THIRD PARTY is an action
+    "email the list to the team",       // same, via email
+    "who is on my contact list",        // scoped question, not the board
     "remind me at 3pm",
     "what's on today",
     "give me everything",          // no "list" word: stays with the brain by design

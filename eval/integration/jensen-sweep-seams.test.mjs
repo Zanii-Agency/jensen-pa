@@ -675,7 +675,11 @@ check("seam.56 morning brief is LOGGED (sendTextAndLog), not sent via the raw un
 check("seam.57 honesty rail exempts a recap/summary read (does not eat it into 'I have not done that yet')", () => {
   const src = read("lib/concierge/honest-reply.ts");
   if (!/READ_ASK/.test(src)) return "no READ_ASK exemption for summary/recap requests";
-  if (!/if \(READ_ASK\.test\(userAsk\)\) return text;/.test(src)) return "READ_ASK is not applied before the claim-rewrite";
+  // The read exemption is applied before the claim-rewrite. Generalised from the
+  // recap-only READ_ASK to schedule/board reads via isReadIntent (KT #206540
+  // read-intent wall); isReadIntent() calls READ_ASK first, so recaps stay exempt.
+  if (!/isReadIntent\(userAsk\)/.test(src)) return "read-intent exemption (isReadIntent) not present";
+  if (!/if \(isReadIntent\(userAsk\)\) return text;/.test(src)) return "read-intent exemption is not applied before the claim-rewrite";
   if (!/honestReply\(reply: string, runs: ToolRun\[\], userAsk/.test(src)) return "honestReply does not accept the userAsk argument";
   const loop = read("lib/concierge/loop.ts");
   if (!/honestReply\(reply, runs, lastUser\)/.test(loop)) return "loop does not pass the user's request into the rail";
