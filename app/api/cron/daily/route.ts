@@ -6,7 +6,7 @@ import { callOwner, twilioConfigured } from "@/lib/voice-call";
 import { dubaiToday, dayPart } from "@/lib/time";
 import { isInWindow } from "@/lib/whatsapp-window";
 import { peekCount } from "@/lib/mail-pending";
-import { admin } from "@/lib/db";
+import { admin, kvGet, kvSet } from "@/lib/db";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -47,7 +47,7 @@ function authed(req: NextRequest): boolean {
   return hdr === `Bearer ${secret}` || key === secret;
 }
 
-async function buildBrief(): Promise<{ text: string; q1: number; call: string }> {
+async function buildBrief(): Promise<{ text: string; q1: number; call: string; note: string }> {
   const today = dubaiToday();
   // Track read failure so a query error is never rendered to Jensen as a
   // confident "clean board" (that would be the is.not.null lie all over again).
@@ -63,7 +63,14 @@ async function buildBrief(): Promise<{ text: string; q1: number; call: string }>
   const greeting = dayPart() === "morning"
     ? `Morning, Jensen. How's the head?`
     : `Good ${dayPart()}, Jensen.`;
-  const lines: string[] = [greeting, "", `Here is your board for today.`];
+  // One-time morning note (operator-set via the `morning_note` kv). Inserted right
+  // after the greeting, then cleared by the caller after a successful send so it
+  // fires EXACTLY once. Absent/empty kv => behaves exactly as before.
+  const noteRaw = await kvGet<string>("morning_note", "").catch(() => "");
+  const note = (typeof noteRaw === "string" ? noteRaw : "").trim();
+  const lines: string[] = [greeting];
+  if (note) lines.push("", note);
+  lines.push("", `Here is your board for today.`);
   if (q1.length) {
     lines.push(`\n*Do first (${q1.length}):*`);
     // Surface staleness so a high-priority item can never rot silently the way
@@ -93,7 +100,7 @@ async function buildBrief(): Promise<{ text: string; q1: number; call: string }>
       : readFailed
       ? `Hello, this is your A.I. concierge from La Rencontre. I had trouble reading your board just now, please check WhatsApp. Have a great day.`
       : `Hello, this is your A.I. concierge from La Rencontre. Your board is clear today, nothing urgent. The full brief is on WhatsApp. Have a great day.`;
-  return { text: lines.join("\n"), q1: q1.length, call };
+  return { text: lines.join("\n"), q1: q1.length, call, note };
 }
 
 export async function GET(req: NextRequest) {
@@ -108,6 +115,12 @@ export async function GET(req: NextRequest) {
     }
 
     const brief = await buildBrief();
+    // Dry run (auth-gated): return the exact rendered brief text WITHOUT sending
+    // or clearing the one-time note. Lets the operator preview tomorrow's 8am
+    // before it reaches Jensen. Read-only.
+    if (new URL(req.url).searchParams.get("dryRun")) {
+      return NextResponse.json({ ok: true, dryRun: true, preview: brief.text, note: brief.note });
+    }
     // Brief goes to JENSEN only (the owner), never the admin/developer.
     const to = owners().filter((n) => whoIs(n).role === "owner");
 
@@ -134,6 +147,10 @@ export async function GET(req: NextRequest) {
         // the bot's own memory of the day (KT #334).
         const ok = await sendTextAndLog(n, brief.text, { party: "jensen" });
         sent[n] = { mode: "text", ok, hoursSince: Number(win.hoursSince.toFixed(1)) };
+        // Clear the one-time note ONLY after it actually went out as text (the
+        // template branch never carries it, so leave it set for the next in-window
+        // brief). null unsets the kv key entirely (KT: one-time semantics).
+        if (ok && brief.note) { await kvSet("morning_note", null).catch(() => {}); }
       } else if (tmplName && tmplName.length > 0) {
         // Template parameters: [q1 count, q2 count, today events count]. Must
         // match the body slots in the template Meta approved. Adjust template
