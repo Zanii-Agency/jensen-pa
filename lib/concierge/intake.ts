@@ -28,7 +28,7 @@ export type Filed = {
 };
 
 export async function classifyAndFile(
-  doc: { id: string; title: string; text: string; entityId?: string },
+  doc: { id: string; title: string; text: string; entityId?: string; dataUrl?: string },
   opts?: { onboarding?: boolean },
 ): Promise<Filed> {
   const onboarding = !!opts?.onboarding;
@@ -49,7 +49,10 @@ export async function classifyAndFile(
       // LISTEN-ONLY: surface what we saw but do NOT write to finance.
       pending = { kind: "expense", amount: c.amount, currency: c.currency || "AED", label, date: c.date || undefined };
     } else {
-      await ops.recordFinance({ kind: "expense", amount: c.amount, vatApplies: true, label, date: c.date || undefined }).catch(() => {});
+      // Link the expense back to the vaulted receipt file (doc.dataUrl = storage
+      // path) so the number traces to its source image (Law 6), and tag the row
+      // source=receipt so it is distinguishable from a hand-entered expense.
+      await ops.recordFinance({ kind: "expense", amount: c.amount, vatApplies: true, label, date: c.date || undefined, receiptUrl: doc.dataUrl, source: "receipt" }).catch(() => {});
       finance = { amount: c.amount, label };
     }
   }

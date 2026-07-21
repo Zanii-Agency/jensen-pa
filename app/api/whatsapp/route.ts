@@ -324,7 +324,7 @@ export async function POST(req: NextRequest) {
       // row, no expense logged). Listen-only means listen-only.
       const prefs = await ops.getPrefs().catch(() => ({} as any));
       const ownerOnboarding = sender.role === "owner" && (prefs as any)?.onboarding !== false;
-      const filed = await classifyAndFile({ id, title, text }, { onboarding: ownerOnboarding });
+      const filed = await classifyAndFile({ id, title, text, dataUrl: storagePath ?? undefined }, { onboarding: ownerOnboarding });
       let msg: string;
       if (unreadable) {
         // Honest: the text could not be read, but the FILE is vaulted (if storage

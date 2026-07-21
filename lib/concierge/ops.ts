@@ -149,8 +149,8 @@ export async function listFinance(f: { entityId?: string; kind?: string } = {}) 
   if (f.kind) qs += `&kind=eq.${enc(f.kind)}`;
   return sbSelect("finance", qs);
 }
-export async function recordFinance(i: { kind: "income" | "expense"; amount: number; vatApplies?: boolean; label: string; date?: string; entityId?: string }) {
-  const row = { id: uid(), kind: i.kind === "income" ? "income" : "expense", amount: Number(i.amount) || 0, vat_applies: !!i.vatApplies, label: i.label, date: i.date || dubaiToday(), entity_id: i.entityId ?? null, created_at: now() };
+export async function recordFinance(i: { kind: "income" | "expense"; amount: number; vatApplies?: boolean; label: string; date?: string; entityId?: string; receiptUrl?: string; source?: "manual" | "receipt" | "recurring" }) {
+  const row = { id: uid(), kind: i.kind === "income" ? "income" : "expense", amount: Number(i.amount) || 0, vat_applies: !!i.vatApplies, label: i.label, date: i.date || dubaiToday(), entity_id: i.entityId ?? null, source: i.source ?? "manual", receipt_url: i.receiptUrl ?? null, created_at: now() };
   await sbInsert("finance", row);
   return { id: row.id, kind: row.kind, amount: row.amount, label: row.label, date: row.date };
 }
