@@ -7,6 +7,7 @@ import { dubaiToday, dayPart } from "@/lib/time";
 import { isInWindow } from "@/lib/whatsapp-window";
 import { peekCount } from "@/lib/mail-pending";
 import { admin, kvGet, kvSet } from "@/lib/db";
+import { cleanForClient } from "@/lib/concierge/updated-list.mjs";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -81,7 +82,7 @@ async function buildBrief(): Promise<{ text: string; q1: number; call: string; n
     q1.slice(0, 5).forEach((t: any) => {
       const created = Number(t.created_at) || 0;
       const days = created ? Math.floor((nowMs - created) / 86_400_000) : 0;
-      lines.push(`• ${t.title}${days >= 2 ? ` (open ${days}d)` : ""}`);
+      lines.push(`• ${cleanForClient(t.title)}${days >= 2 ? ` (open ${days}d)` : ""}`);
     });
   } else if (readFailed) {
     lines.push(`\n*Do first:* I could not fully read your board just now. Open the portal or ask me again in a moment, I do not want to tell you it is clear if it is not.`);
@@ -90,7 +91,7 @@ async function buildBrief(): Promise<{ text: string; q1: number; call: string; n
   }
   if (events.length) {
     lines.push(`\n*Today's schedule:*`);
-    events.slice(0, 6).forEach((e: any) => lines.push(`• ${e.time ? e.time + " " : ""}${e.title}`));
+    events.slice(0, 6).forEach((e: any) => lines.push(`• ${e.time ? e.time + " " : ""}${cleanForClient(e.title)}`));
   }
   if (q2.length) lines.push(`\n${q2.length} important item${q2.length > 1 ? "s" : ""} I'm protecting for you.`);
   lines.push(`\nReply here anytime and I'll handle it.`);

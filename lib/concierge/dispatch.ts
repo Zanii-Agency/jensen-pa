@@ -23,6 +23,34 @@ const ZANII_READS = new Set([
   "search_email", "get_settings", "entity_dashboard", "finance_summary", "morning_brief",
   "vat_report", "ct_estimate",
 ]);
+
+// PARTY WALL ON PERSISTENT WRITES (Law 9 single-tenant + Law 10 test-mode).
+// Jensen's board / brief / portal render every row of these tables verbatim, so a
+// task/event/etc. created in a Taona (admin/dev/test) turn leaks into the client's
+// world. On 2026-07-22 three of Taona's own dev tasks ("Evaluate Agent-Reach",
+// "Vibe-Trading", "Trading ledger") were sitting in Jensen's board this way. The
+// codebase already walls Taona out of Jensen's auto-captured memory (loop.ts:
+// captureSalience runs for party==="jensen" only); this extends the SAME wall to
+// tool writes, which had no such guard. A non-jensen turn gets a simulated result
+// (dev sees what would have happened) and NOTHING persists to Jensen's tenant.
+// Real changes to Jensen's data go through Jensen's own authenticated portal.
+const TENANT_WRITES = new Set<string>([
+  "create_entity", "update_entity", "delete_entity",
+  "create_task", "send_task_to_peer", "update_task", "complete_task", "delete_task", "accept_meeting_tasks",
+  "create_event", "update_event", "delete_event", "complete_event",
+  "record_finance", "update_finance", "delete_finance",
+  "file_document", "delete_document",
+  "set_legal_blueprint",
+  "add_contact", "update_contact", "delete_contact",
+  "add_note", "delete_note",
+  "remember_fact", "remember_preference", "forget_memory",
+  "update_prefs", "set_goals",
+]);
+// True when this write must be walled off: a real persistent write to Jensen's
+// tenant requested by anyone other than Jensen himself.
+export function skipTenantWriteForDev(name: string, party?: string): boolean {
+  return !!party && party !== "jensen" && TENANT_WRITES.has(name);
+}
 import { kvGet } from "../db";
 import { sbSelect, enc } from "./rest";
 import { sendWhatsAppDocument, devPhone, whoIs } from "../whatsapp";
@@ -303,6 +331,12 @@ export async function runAction(name: string, input: any, ctx?: { party?: string
   try {
     const gated = destructiveGate(name, input, ctx?.lastUser || "");
     if (gated) return gated;
+    // Party wall: a non-Jensen (admin/dev/test) turn never persists to Jensen's
+    // tenant. Return a simulated result so the model can tell the operator what it
+    // WOULD have done, without polluting the client's board / brief / portal.
+    if (skipTenantWriteForDev(name, ctx?.party)) {
+      return { ok: true, result: { simulated: true, tool: name, persisted: false, note: "Dev/admin turn: not written to Jensen's tenant (single-tenant wall). Change Jensen's real data through his own portal." } };
+    }
     let result: Result;
     switch (name) {
       // entities

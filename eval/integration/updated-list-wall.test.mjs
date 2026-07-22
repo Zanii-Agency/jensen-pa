@@ -7,7 +7,34 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isUpdatedListRequest, formatUpdatedList } from "../../lib/concierge/updated-list.mjs";
+import { isUpdatedListRequest, formatUpdatedList, cleanForClient } from "../../lib/concierge/updated-list.mjs";
+
+// CLIENT-BOUNDARY SANITIZER (live incident, 2026-07-22). A dev task title with an
+// emoji (⭐), arrows (→) and an em-dash rendered raw on Jensen's luxury board.
+// cleanForClient is the wall: strips emoji/symbols/arrows, converts em/en dashes
+// to commas, at the seam where table data becomes client copy.
+test("cleanForClient strips emoji, arrows and dashes from the exact leaked title", () => {
+  const raw = "Evaluate Agent-Reach (Panniantong, 56.8k⭐ GitHub, MIT) — CLI that gives AI agents free read+search. Caveat: install runs remote shell → sandbox it; logins → use secondary accounts.";
+  const out = cleanForClient(raw);
+  assert.ok(!/[⭐→—–]/u.test(out), `no emoji/arrows/em-dash should survive: "${out}"`);
+  assert.ok(!/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2190}-\u{21FF}]/u.test(out), "no pictographs/symbols survive");
+  assert.match(out, /Evaluate Agent-Reach/); // hyphen-minus in a word is fine, content preserved
+  assert.match(out, /MIT\), CLI/);            // em-dash became a comma
+});
+
+test("cleanForClient is a no-op on already-clean luxury copy", () => {
+  for (const s of ["Afrosensia: presentation and agreement", "Meeting with Sotiris (La Rencontre x Mawhub)", "Update menu for Sohum"]) {
+    assert.equal(cleanForClient(s), s, `should pass through unchanged: "${s}"`);
+  }
+});
+
+test("formatUpdatedList sanitizes a polluted task title in the rendered board", () => {
+  const out = formatUpdatedList({
+    tasks: [{ title: "Dirty task ⭐ do X → then Y — now", quadrant: 1, done: false }],
+    events: [], today: "2026-07-22", name: "Jensen",
+  });
+  assert.ok(!/[⭐→—]/u.test(out), `board must not carry emoji/arrows/em-dash: "${out}"`);
+});
 
 test("isUpdatedListRequest fires on the operator's real phrasings", () => {
   for (const s of [
