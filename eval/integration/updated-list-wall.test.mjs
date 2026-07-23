@@ -36,6 +36,27 @@ test("formatUpdatedList sanitizes a polluted task title in the rendered board", 
   assert.ok(!/[⭐→—]/u.test(out), `board must not carry emoji/arrows/em-dash: "${out}"`);
 });
 
+// cleanForClient also runs over forwarded EMAIL snippets (mail-sweep buildEmailBody).
+// Real leaks it must scrub: a "🌴" sign-off, a "📍 📞 ✆ ✉️ 📸" signature, an en-dash
+// in a title line. Crucially it must NOT flatten the email's line breaks, and must
+// leave phone numbers / emails / URLs intact.
+test("cleanForClient scrubs a real email signature but keeps newlines and contact data", () => {
+  const sig = "Prasanth Mohankumar\nBar Manager | Panther Dubai\n📍 Jewel of the Creek, UAE\n📞 +971 54 257 4148 | ✆ WhatsApp: +971 54 474 1585\n✉️ prasanth.mohankumar@pantherdxb.com\n📸 Instagram: @panther";
+  const out = cleanForClient(sig);
+  assert.ok(!/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(out), `no emoji/symbols survive: ${JSON.stringify(out)}`);
+  assert.ok(out.split("\n").length >= 5, "line breaks preserved");
+  assert.match(out, /\+971 54 257 4148/);              // phone intact
+  assert.match(out, /prasanth\.mohankumar@pantherdxb\.com/); // email intact
+  assert.match(out, /Senior|Bar Manager/);
+});
+
+test("cleanForClient turns a signature en-dash into a comma without eating the line", () => {
+  const out = cleanForClient("Sean Fuller\nSenior Manager – Partnership, Al Ghurair");
+  assert.ok(!/[–—]/.test(out), "no en/em dash");
+  assert.match(out, /Senior Manager, Partnership/);
+  assert.equal(out.split("\n").length, 2, "still two lines");
+});
+
 test("isUpdatedListRequest fires on the operator's real phrasings", () => {
   for (const s of [
     "updated list",

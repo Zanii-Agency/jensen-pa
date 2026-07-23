@@ -13,6 +13,7 @@
 
 import { aggregateInbox, readUnified, type UMailSummary } from "@/lib/mail-provider";
 import { triageInbox, type TriagedMail } from "@/lib/mail-triage";
+import { cleanForClient } from "@/lib/concierge/updated-list.mjs";
 import { rememberEmail } from "@/lib/concierge/brain";
 import { sendTextAndLog } from "@/lib/sendTextAndLog";
 import { kvGet, kvSet } from "@/lib/db";
@@ -78,13 +79,18 @@ function buildEmailBody(m: TriagedMail): string {
           : m.quadrant === 2 ? "Q2 (important)"
           : m.quadrant === 3 ? "Q3 (urgent only)"
           : "Q4";
-  const fromLine = m.from && m.from !== m.fromEmail ? `${m.from} <${m.fromEmail}>` : (m.fromEmail || m.from);
-  const body = m.snippet || m.summary || "(no preview)";
+  // The From / Subject / body are the SENDER's text, forwarded verbatim into a
+  // luxury client surface. Run them through the same client-boundary wall as the
+  // board so a sender's emoji signature ("📍 📞 ✉️", "nice evening 🌴") or an
+  // en-dash does not land on Jensen. cleanForClient is newline-safe, so the body
+  // keeps its line breaks. (Email addresses, URLs, phone numbers are untouched.)
+  const fromLine = cleanForClient(m.from && m.from !== m.fromEmail ? `${m.from} <${m.fromEmail}>` : (m.fromEmail || m.from));
+  const body = cleanForClient(m.snippet || m.summary || "(no preview)");
   return [
     "I noticed a new email that needs your eyes.",
     "",
     `From: ${fromLine}`,
-    `Subject: ${m.subject}`,
+    `Subject: ${cleanForClient(m.subject)}`,
     `Mailbox: ${m.accountEmail}`,
     `Priority: ${q}`,
     "",
