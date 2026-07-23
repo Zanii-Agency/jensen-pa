@@ -63,7 +63,48 @@ export async function listEntities(f: { kind?: string; status?: string } = {}) {
   return sbSelect("entities", qs);
 }
 export async function findEntity(name: string) { return sbSelect("entities", `name=${like(name)}&limit=5`); }
+// Normalized identity key for people/entities: lowercase, strip punctuation,
+// collapse spaces. EXACT match only — "Karafotias" == "karafotias" but NOT a
+// spelling variant ("Jatin" vs "Jhatin"), which would risk merging two real people.
+export function normalizeName(s: string): string {
+  return (s || "").toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+}
+
+// Pure dedup decision for contacts (testable). The id of the SINGLE existing
+// same-name contact whose identity is COMPATIBLE (no conflicting email/phone), or
+// null. Conflicting identity (different email/phone) or ambiguity -> null (insert
+// new; never merge two distinct people who share a name).
+export function pickContactDup(
+  existing: { id: string; name: string; email?: string | null; phone?: string | null }[],
+  name: string,
+  email?: string | null,
+  phone?: string | null,
+): string | null {
+  const key = normalizeName(name);
+  if (!key) return null;
+  const e = (email || "").toLowerCase().trim();
+  const p = (phone || "").replace(/\D/g, "");
+  // Skeptic CRITICAL: a same-NAME match is NOT enough to merge — two different
+  // people share a first name (Ahmed the driver vs Ahmed the supplier), both
+  // blank, would be wrong-merged. Require a POSITIVE shared identity signal
+  // (matching email or phone). Name-only collisions insert a new row (a harmless
+  // extra the owner can merge), never a silent wrong-merge.
+  if (!e && !p) return null;
+  const confirmed = (existing || []).filter((c) => {
+    if (normalizeName(c.name) !== key) return false;
+    const ce = (c.email || "").toLowerCase().trim();
+    const cp = (c.phone || "").replace(/\D/g, "");
+    return (!!e && ce === e) || (!!p && cp === p);
+  });
+  return confirmed.length === 1 ? confirmed[0].id : null;
+}
+
 export async function createEntity(i: { kind: string; name: string; subtitle?: string; status?: string; notes?: string }) {
+  // No auto-dedup here (skeptic CRITICAL): entities have no secondary identity
+  // signal, so name-only merge would silently alias two distinct same-named orgs
+  // ("A&B Catering" vs "AB Catering", two clients named "Sohum"). findEntity lets
+  // the model look up first; a real duplicate is a human-confirmed merge, not a
+  // silent one. Insert-only is the safe choice (an extra row beats a wrong-merge).
   const row = { id: uid(), kind: i.kind, name: i.name, subtitle: i.subtitle ?? null, status: i.status ?? null, notes: i.notes ?? null, created_at: now() };
   await sbInsert("entities", row);
   return { id: row.id, kind: i.kind, name: i.name };
@@ -108,8 +149,8 @@ export async function listFinance(f: { entityId?: string; kind?: string } = {}) 
   if (f.kind) qs += `&kind=eq.${enc(f.kind)}`;
   return sbSelect("finance", qs);
 }
-export async function recordFinance(i: { kind: "income" | "expense"; amount: number; vatApplies?: boolean; label: string; date?: string; entityId?: string }) {
-  const row = { id: uid(), kind: i.kind === "income" ? "income" : "expense", amount: Number(i.amount) || 0, vat_applies: !!i.vatApplies, label: i.label, date: i.date || dubaiToday(), entity_id: i.entityId ?? null, created_at: now() };
+export async function recordFinance(i: { kind: "income" | "expense"; amount: number; vatApplies?: boolean; label: string; date?: string; entityId?: string; receiptUrl?: string; source?: "manual" | "receipt" | "recurring" }) {
+  const row = { id: uid(), kind: i.kind === "income" ? "income" : "expense", amount: Number(i.amount) || 0, vat_applies: !!i.vatApplies, label: i.label, date: i.date || dubaiToday(), entity_id: i.entityId ?? null, source: i.source ?? "manual", receipt_url: i.receiptUrl ?? null, created_at: now() };
   await sbInsert("finance", row);
   return { id: row.id, kind: row.kind, amount: row.amount, label: row.label, date: row.date };
 }
@@ -183,6 +224,42 @@ export function normalizeEventTitleKey(title: string): string {
     .trim();
 }
 
+// Pure reconcile decision (Phase 2, unit-testable): the id of the SINGLE upcoming
+// event that shares this identity on a different date (the meeting being moved),
+// or null when there is no unambiguous single match (insert a fresh event instead
+// of blind-merging two distinct same-title meetings).
+// Generic identities that are NOT distinctive enough to assume "same meeting
+// moved" — two "Review"s on different days are usually different meetings. Only a
+// distinctive identity (a name/org: sotiris, karafotias, a2 milk) reconciles.
+const GENERIC_EVENT_KEYS = new Set([
+  "", "review", "call", "sync", "meeting", "catch up", "catchup", "standup",
+  "lunch", "dinner", "coffee", "chat", "check in", "checkin", "1 1", "one on one",
+]);
+
+export function pickReconcileTarget(
+  upcoming: { id: string; title: string; date: string; recurrence?: string | null; entity_id?: string | null }[],
+  key: string,
+  newDate: string,
+  newEntityId?: string | null,
+): string | null {
+  // Guard 1: a generic title is never reconciled (would move a distinct meeting).
+  if (GENERIC_EVENT_KEYS.has(key) || key.length < 4) return null;
+  const matches = (upcoming || []).filter(
+    (r) =>
+      normalizeEventTitleKey(r.title) === key &&
+      r.date !== newDate &&
+      // Guard 2 (skeptic F1, CRITICAL): never move a RECURRING anchor — a weekly
+      // meeting is a single upcoming row; reconciling it corrupts the whole series.
+      // A recurring meeting is moved via update_event, never via a new create.
+      !r.recurrence &&
+      // Guard 3 (skeptic F3, HIGH): if both carry an entity, they must be the SAME
+      // entity. Two distinct meetings with the same person (same title key) must not
+      // merge. Absent entity on either side falls back to title-identity only.
+      (!newEntityId || !r.entity_id || r.entity_id === newEntityId),
+  );
+  return matches.length === 1 ? matches[0].id : null;
+}
+
 export async function createEvent(i: { title: string; date: string; time?: string; entityId?: string; note?: string; recurrence?: string; recurrenceUntil?: string; meetingUrl?: string }) {
   // Soft-dedup: normalized title + same date (+ same time if both provided) is
   // the same event, not a copy. Prevents the 06-13 Karafotias case where the
@@ -197,6 +274,23 @@ export async function createEvent(i: { title: string; date: string; time?: strin
       return true;
     });
     if (dup) return { id: dup.id, title: dup.title, date: i.date, deduped: true };
+
+    // Cross-date identity reconcile (Phase 2 — kills the duplicate-meeting class,
+    // e.g. the 3 "Meeting with Sotiris" rows across 06-17/26/29). If EXACTLY ONE
+    // upcoming event shares this identity on a DIFFERENT date, a "new" create is
+    // that meeting being MOVED, not a copy: update it in place. Ambiguous (0 or
+    // 2+ matches) falls through to insert — we never blind-merge two distinct
+    // same-title meetings. Guards (skeptic-hardened): generic titles, RECURRING
+    // anchors, and differing-entity meetings are all excluded from reconcile.
+    const today = dubaiToday(); // skeptic F5: Dubai +4, not raw UTC (matches the rest of this file)
+    const upcoming = await sbSelect<any>("events", `date=gte.${enc(today)}&select=id,title,date,time,recurrence,entity_id&limit=50`).catch(() => []);
+    const targetId = pickReconcileTarget(upcoming as any[], key, i.date, i.entityId);
+    if (targetId) {
+      // Forward the fields the model supplied on THIS create (skeptic F2): a move
+      // that drops the new note/entity silently loses the operator's intent.
+      await updateEvent({ id: targetId, date: i.date, time: i.time, meetingUrl: i.meetingUrl, note: i.note, entityId: i.entityId });
+      return { id: targetId, title: i.title, date: i.date, reconciled: true };
+    }
   }
   const validRecurrence = ["weekly", "monthly", "yearly"].includes(i.recurrence || "") ? i.recurrence : null;
   const row: any = { id: uid(), title: i.title, date: i.date, time: i.time ?? null, entity_id: i.entityId ?? null, note: i.note ?? null, recurrence: validRecurrence, recurrence_until: i.recurrenceUntil ?? null, created_at: now() };
@@ -207,6 +301,9 @@ export async function createEvent(i: { title: string; date: string; time?: strin
 export async function updateEvent(i: any) {
   const patch: any = {};
   for (const k of ["title", "date", "time", "note", "recurrence", "recurrence_until"]) if (i[k] !== undefined) patch[k] = i[k];
+  // entityId maps to entity_id (the loop above uses snake_case keys; the camelCase
+  // entityId the model/reconcile passes was previously dropped on update).
+  if (i.entityId !== undefined) patch.entity_id = i.entityId;
   // Meeting link maps to the meeting_url column (only when provided, never clobbered to null).
   if (i.meetingUrl) patch.meeting_url = i.meetingUrl;
   // Wall-at-primitive: any change to fire-time invalidates the reminder latch.
@@ -255,6 +352,22 @@ export async function deleteNote(id: string) { await sbDelete("notes", `id=eq.${
 export async function listContacts() { return sbSelect("contacts", "order=created_at.desc"); }
 export async function findContact(q: string) { return sbSelect("contacts", `or=(name.${like(q)},company.${like(q)})&limit=8`); }
 export async function addContact(i: { name: string; company?: string; role?: string; email?: string; phone?: string; entityId?: string }) {
+  // Dedup (the recurring "same person" / duplicate-contact friction): a same-name
+  // compatible contact already exists -> enrich its blank fields instead of making
+  // a second row. Conflicting email/phone -> different person -> insert new.
+  const existing = await sbSelect<any>("contacts", `order=created_at.asc&select=id,name,email,phone,company,role,entity_id&limit=200`).catch(() => []);
+  const dupId = pickContactDup(existing as any[], i.name, i.email, i.phone);
+  if (dupId) {
+    const cur = (existing as any[]).find((c) => c.id === dupId) || {};
+    const patch: any = {};
+    if (i.email && !cur.email) patch.email = i.email;
+    if (i.phone && !cur.phone) patch.phone = i.phone;
+    if (i.company && !cur.company) patch.company = i.company;
+    if (i.role && !cur.role) patch.role = i.role;
+    if (i.entityId && !cur.entity_id) patch.entity_id = i.entityId;
+    if (Object.keys(patch).length) await sbUpdate("contacts", `id=eq.${enc(dupId)}`, patch).catch(() => {});
+    return { id: dupId, name: i.name, deduped: true };
+  }
   const row = { id: uid(), name: i.name, company: i.company ?? null, role: i.role ?? null, email: i.email ?? null, phone: i.phone ?? null, entity_id: i.entityId ?? null, created_at: now() };
   await sbInsert("contacts", row);
   return { id: row.id, name: i.name };

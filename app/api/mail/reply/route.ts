@@ -19,6 +19,7 @@ export async function POST(req: NextRequest) {
       try {
         const r = await sendMail(creds, { to: b.to, subject: b.subject, text: b.text || "", inReplyTo: b.inReplyTo });
         if (!r.ok) return NextResponse.json({ error: r.error }, { status: 502 });
+        import("@/lib/zanii").then(({ recordAction }) => recordAction("email.send", { to: b.to, subject: b.subject, channel: "imap", ok: true, via: "portal" })).catch(() => {});
         return NextResponse.json({ ok: true });
       } catch (e: any) {
         return NextResponse.json({ error: e?.message || String(e) }, { status: 500 });
@@ -27,6 +28,7 @@ export async function POST(req: NextRequest) {
     // OAuth (Microsoft / Zoho) item.
     try {
       await sendUnified(accountId, b.to, b.subject, b.text || "");
+      import("@/lib/zanii").then(({ recordAction }) => recordAction("email.send", { to: b.to, subject: b.subject, channel: "oauth", ok: true, via: "portal" })).catch(() => {});
       return NextResponse.json({ ok: true });
     } catch (e: any) {
       return NextResponse.json({ error: e?.message || String(e) }, { status: 502 });
@@ -40,6 +42,7 @@ export async function POST(req: NextRequest) {
     const attachments: OutAttachment[] = Array.isArray(b.attachments) ? b.attachments : [];
     const r = await sendMail(creds, { to: b.to, subject: b.subject, text: b.text || "", inReplyTo: b.inReplyTo, attachments });
     if (!r.ok) return NextResponse.json({ error: r.error }, { status: 502 });
+    import("@/lib/zanii").then(({ recordAction }) => recordAction("email.send", { to: b.to, subject: b.subject, channel: "imap-legacy", attachments: attachments.length, ok: true, via: "portal" })).catch(() => {});
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || String(e) }, { status: 500 });

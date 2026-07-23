@@ -25,12 +25,20 @@
 
 import { admin } from "./db";
 
-// How long the winner waits for the rest of a human's burst to land before it
-// assembles the turn. WhatsApp bursts land within a few seconds; 7s covers
-// "you're cool" + "thanks" without making the reply feel laggy. The route's
-// maxDuration is 120s, so the hold is comfortably within budget, and a Meta
-// retry during the hold is absorbed by the wa_seen dedup.
-const SETTLE_MS = 7000;
+// ADAPTIVE settle (KT: Jensen-elevation Phase 0 — latency). The winner waits for
+// the rest of a human's burst, but only as long as the human is still typing.
+// The old flat 7s sleep ran on EVERY turn, even single messages (the common case
+// per the transcript: median turn 10.7s, ~7s of it this sleep). Now we POLL for
+// burst activity: assemble as soon as the sender has been quiet for QUIET_MS,
+// capped at SETTLE_CAP_MS. A lone message settles in ~QUIET_MS instead of 7s; a
+// real burst still coalesces (each new inbound resets the quiet timer); the 7s
+// ceiling is unchanged so the double-reply guarantee (KT #327) is never weakened.
+// zanii-codef: QUIET_MS=2500 trades a small slice of burst-merge window for a
+// ~4.5s/turn latency win; bursts with >2.5s inter-message gaps were arguably
+// separate thoughts. Raise QUIET_MS toward 7000 if double-replies reappear.
+const SETTLE_CAP_MS = 7000; // hard ceiling: the longest we ever hold (unchanged)
+const QUIET_MS = 2500; // assemble once the burst has been quiet this long
+const POLL_MS = 500; // burst-activity poll cadence during the settle
 // Claim TTL. A crashed winner's claim is overwritable past this, so a dropped
 // invocation can never wedge a sender into permanent silence.
 const CLAIM_TTL_MS = 90_000;
@@ -108,18 +116,63 @@ async function acquireClaim(db: any, sender: string, traceId: string | null): Pr
   return false;
 }
 
-// Assemble the burst: ALL inbound (role='user') for this party SINCE the last
-// reply (role='assistant'), chronological, concatenated. The assistant reply is
-// the turn boundary, so once the winner replies the next burst starts cleanly.
-async function assembleBurst(db: any, party: string): Promise<{ command: string; ids: string[] }> {
-  const { data: lastAsst } = await db
+// The turn boundary: ts of this party's last assistant reply (0 if none). Shared
+// by assembleBurst (what to fold in) and countBurst (is the burst still growing).
+async function lastReplyTs(db: any, party: string): Promise<number> {
+  const { data } = await db
     .from("chat_messages")
     .select("ts")
     .eq("party", party)
     .eq("role", "assistant")
     .order("ts", { ascending: false })
     .limit(1);
-  const sinceTs: number = lastAsst && lastAsst[0] ? Number(lastAsst[0].ts) : 0;
+  return data && data[0] ? Number(data[0].ts) : 0;
+}
+
+// Count of unanswered inbound rows for this party since the last reply. The
+// adaptive settle watches this number: while it grows the human is still typing.
+async function countBurst(db: any, party: string): Promise<number> {
+  const sinceTs = await lastReplyTs(db, party);
+  let q = db.from("chat_messages").select("id").eq("party", party).eq("role", "user");
+  if (sinceTs) q = q.gt("ts", sinceTs);
+  const { data } = await q.limit(50);
+  return (data || []).length;
+}
+
+// Adaptive settle: poll burst activity and return as soon as the sender has been
+// quiet for `quietMs`, or `capMs` elapses. `getCount` is injected so this is a
+// pure, unit-testable function (no DB / no real clock dependency in the test).
+export async function settleForBurst(
+  getCount: () => Promise<number>,
+  opts: { capMs?: number; quietMs?: number; pollMs?: number } = {},
+): Promise<{ waitedMs: number; cappedOut: boolean }> {
+  const capMs = opts.capMs ?? SETTLE_CAP_MS;
+  const quietMs = opts.quietMs ?? QUIET_MS;
+  const pollMs = opts.pollMs ?? POLL_MS;
+  const start = Date.now();
+  const deadline = start + capMs;
+  let lastCount = await getCount();
+  let quietSince = Date.now();
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(pollMs, remaining));
+    const c = await getCount();
+    if (c > lastCount) {
+      lastCount = c; // new inbound landed -> the human is still typing, keep waiting
+      quietSince = Date.now();
+    } else if (Date.now() - quietSince >= quietMs) {
+      return { waitedMs: Date.now() - start, cappedOut: false }; // quiet -> assemble
+    }
+  }
+  return { waitedMs: Date.now() - start, cappedOut: true };
+}
+
+// Assemble the burst: ALL inbound (role='user') for this party SINCE the last
+// reply (role='assistant'), chronological, concatenated. The assistant reply is
+// the turn boundary, so once the winner replies the next burst starts cleanly.
+async function assembleBurst(db: any, party: string): Promise<{ command: string; ids: string[] }> {
+  const sinceTs: number = await lastReplyTs(db, party);
 
   let q = db
     .from("chat_messages")
@@ -179,14 +232,16 @@ export async function coalesceTurn(
     return { proceed: false, winner: false };
   }
 
-  // WINNER. Settle so the rest of the human's burst lands, then assemble.
+  // WINNER. Settle (adaptively) so the rest of the human's burst lands, then assemble.
   try {
-    await sleep(SETTLE_MS);
+    const settle = await settleForBurst(() => countBurst(db, party));
     const { command, ids } = await assembleBurst(db, party);
     // Empty burst read (rows already past a prior assistant boundary, or a
     // transient miss) -> fall back to the single message so we still reply.
     const finalCommand = command && command.trim() ? command : fallbackCommand;
-    await emitCoalesce("winner", sender, { burst: ids.length, chars: finalCommand.length });
+    // settle_ms is the LIVE discriminator for the adaptive-settle deploy: a quiet
+    // single message reads ~QUIET_MS (2500), never the old flat 7000.
+    await emitCoalesce("winner", sender, { burst: ids.length, chars: finalCommand.length, settle_ms: settle.waitedMs, capped: settle.cappedOut });
     return { proceed: true, winner: true, command: finalCommand, claimedIds: ids };
   } catch (e: any) {
     // Assembly failed AFTER we won. Release the claim so the next message can

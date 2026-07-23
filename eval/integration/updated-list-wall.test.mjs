@@ -7,7 +7,55 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isUpdatedListRequest, formatUpdatedList } from "../../lib/concierge/updated-list.mjs";
+import { isUpdatedListRequest, formatUpdatedList, cleanForClient } from "../../lib/concierge/updated-list.mjs";
+
+// CLIENT-BOUNDARY SANITIZER (live incident, 2026-07-22). A dev task title with an
+// emoji (⭐), arrows (→) and an em-dash rendered raw on Jensen's luxury board.
+// cleanForClient is the wall: strips emoji/symbols/arrows, converts em/en dashes
+// to commas, at the seam where table data becomes client copy.
+test("cleanForClient strips emoji, arrows and dashes from the exact leaked title", () => {
+  const raw = "Evaluate Agent-Reach (Panniantong, 56.8k⭐ GitHub, MIT) — CLI that gives AI agents free read+search. Caveat: install runs remote shell → sandbox it; logins → use secondary accounts.";
+  const out = cleanForClient(raw);
+  assert.ok(!/[⭐→—–]/u.test(out), `no emoji/arrows/em-dash should survive: "${out}"`);
+  assert.ok(!/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2190}-\u{21FF}]/u.test(out), "no pictographs/symbols survive");
+  assert.match(out, /Evaluate Agent-Reach/); // hyphen-minus in a word is fine, content preserved
+  assert.match(out, /MIT\), CLI/);            // em-dash became a comma
+});
+
+test("cleanForClient is a no-op on already-clean luxury copy", () => {
+  for (const s of ["Afrosensia: presentation and agreement", "Meeting with Sotiris (La Rencontre x Mawhub)", "Update menu for Sohum"]) {
+    assert.equal(cleanForClient(s), s, `should pass through unchanged: "${s}"`);
+  }
+});
+
+test("formatUpdatedList sanitizes a polluted task title in the rendered board", () => {
+  const out = formatUpdatedList({
+    tasks: [{ title: "Dirty task ⭐ do X → then Y — now", quadrant: 1, done: false }],
+    events: [], today: "2026-07-22", name: "Jensen",
+  });
+  assert.ok(!/[⭐→—]/u.test(out), `board must not carry emoji/arrows/em-dash: "${out}"`);
+});
+
+// cleanForClient also runs over forwarded EMAIL snippets (mail-sweep buildEmailBody).
+// Real leaks it must scrub: a "🌴" sign-off, a "📍 📞 ✆ ✉️ 📸" signature, an en-dash
+// in a title line. Crucially it must NOT flatten the email's line breaks, and must
+// leave phone numbers / emails / URLs intact.
+test("cleanForClient scrubs a real email signature but keeps newlines and contact data", () => {
+  const sig = "Prasanth Mohankumar\nBar Manager | Panther Dubai\n📍 Jewel of the Creek, UAE\n📞 +971 54 257 4148 | ✆ WhatsApp: +971 54 474 1585\n✉️ prasanth.mohankumar@pantherdxb.com\n📸 Instagram: @panther";
+  const out = cleanForClient(sig);
+  assert.ok(!/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(out), `no emoji/symbols survive: ${JSON.stringify(out)}`);
+  assert.ok(out.split("\n").length >= 5, "line breaks preserved");
+  assert.match(out, /\+971 54 257 4148/);              // phone intact
+  assert.match(out, /prasanth\.mohankumar@pantherdxb\.com/); // email intact
+  assert.match(out, /Senior|Bar Manager/);
+});
+
+test("cleanForClient turns a signature en-dash into a comma without eating the line", () => {
+  const out = cleanForClient("Sean Fuller\nSenior Manager – Partnership, Al Ghurair");
+  assert.ok(!/[–—]/.test(out), "no en/em dash");
+  assert.match(out, /Senior Manager, Partnership/);
+  assert.equal(out.split("\n").length, 2, "still two lines");
+});
 
 test("isUpdatedListRequest fires on the operator's real phrasings", () => {
   for (const s of [
@@ -20,6 +68,18 @@ test("isUpdatedListRequest fires on the operator's real phrasings", () => {
     "give me my list",
     "list",
     "show me the updated list please",
+    // The verbatim 07-21 phrasings that the tight matcher MISSED, so the request
+    // fell to the brain and looped hollow "Already in the system" / "I have not
+    // done that yet" replies. These are the operator's own words, they ARE the
+    // contract: every one must reach the deterministic board.
+    "Hello pull up my updated list with all reminders",
+    "Pull out my full updated list meaning with all upcoming reminders",
+    "what I mean I need my updated list which has all my task and upcmoning reminders",
+    "I want you to send me my updated list as in to do list with urgent not urgent etc and all upcoming events",
+    "I need my updated task list",
+    "updated task",
+    "give me the list",
+    "whats on the board",
   ]) {
     assert.equal(isUpdatedListRequest(s), true, `should match: "${s}"`);
   }
@@ -30,7 +90,9 @@ test("isUpdatedListRequest does NOT hijack compound or scoped commands", () => {
     "list tasks for Acme",
     "add milk to my list",
     "updated list and add a task to review the contract",
-    "send the list to John",
+    "send the list to John",            // sending the list to a THIRD PARTY is an action
+    "email the list to the team",       // same, via email
+    "who is on my contact list",        // scoped question, not the board
     "remind me at 3pm",
     "what's on today",
     "give me everything",          // no "list" word: stays with the brain by design

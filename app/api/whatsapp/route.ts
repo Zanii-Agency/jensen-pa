@@ -13,7 +13,8 @@ import { uploadReceipt } from "@/lib/storage";
 import { embed, chunk } from "@/lib/openai";
 import { transcribeAudio } from "@/lib/transcribe";
 import { sbSelect, enc } from "@/lib/concierge/rest";
-import { extractMeetingLink, dispatchMeetingBot, isCancelIntent, cancelActiveBot } from "@/lib/digital-u";
+import { extractMeetingLink, extractAnyUrl, resolveEventByIdentity, dispatchMeetingBot, isCancelIntent, cancelActiveBot } from "@/lib/digital-u";
+import { parkLink } from "@/lib/pending-links";
 import { shouldProcess, mediaArrived } from "@/lib/brain-core/index.js";
 import { coalesceTurn, finishTurn } from "@/lib/whatsapp-coalesce";
 import { parseStatuses, shouldApplyStatus } from "@/lib/concierge/wa-delivery.mjs";
@@ -323,7 +324,7 @@ export async function POST(req: NextRequest) {
       // row, no expense logged). Listen-only means listen-only.
       const prefs = await ops.getPrefs().catch(() => ({} as any));
       const ownerOnboarding = sender.role === "owner" && (prefs as any)?.onboarding !== false;
-      const filed = await classifyAndFile({ id, title, text }, { onboarding: ownerOnboarding });
+      const filed = await classifyAndFile({ id, title, text, dataUrl: storagePath ?? undefined }, { onboarding: ownerOnboarding });
       let msg: string;
       if (unreadable) {
         // Honest: the text could not be read, but the FILE is vaulted (if storage
@@ -386,11 +387,17 @@ export async function POST(req: NextRequest) {
     // time and schedule the join best-effort (silent: it just starts working once
     // the note-taker auth is fixed). The link reaches him via the reminder either
     // way, independent of whether the join ever succeeds.
+    // Phase 1 link/memory convergence (KT #206577 line, supersedes the fuzzy
+    // matcher). Capture ANY url (not just joinable platforms — the Luma drop), and
+    // resolve the target event by IDENTITY not any-word substring (the Sotiris->A2
+    // Milk misroute). meetingLink stays the join gate (can only send a bot into a
+    // real Meet/Zoom/Teams room); anyLink is what we SAVE.
     const meetingLink = extractMeetingLink(text);
-    if (meetingLink) {
-      const rest = text.replace(meetingLink, "").trim();
+    const anyLink = extractAnyUrl(text);
+    if (anyLink) {
+      const rest = text.replace(anyLink, "").trim();
       const JOIN_INTENT_RE = /\b(join|take notes|note ?taker|attend|cover)\b/i;
-      const wantsJoin = JOIN_INTENT_RE.test(rest);
+      const wantsJoin = JOIN_INTENT_RE.test(rest) && !!meetingLink; // only a joinable platform
       const inboundParty = sender.role !== "owner" ? "taona" : "jensen";
       const botName = sender.role !== "owner" ? "Digital Taona" : "Digital Jensen";
       await ops.chatAppend("user", text, "whatsapp", inboundParty, { externalId: inboundWamid }).catch(() => {});
@@ -399,22 +406,26 @@ export async function POST(req: NextRequest) {
         const today = new Date().toISOString().slice(0, 10);
         const events = await sbSelect<any>(
           "events",
-          `date=gte.${enc(today)}&time=not.is.null&order=date.asc&limit=5&select=id,title,date,time`
+          `date=gte.${enc(today)}&time=not.is.null&order=date.asc&limit=10&select=id,title,date,time`
         ).catch(() => []);
-        const match = (events as any[]).find((e: any) => {
-          const t = (e.title || "").toLowerCase();
-          return rest.toLowerCase().split(/\s+/).some((w: string) => w.length > 3 && t.includes(w));
-        });
+        // Identity match: a single event whose title shares a DISTINCTIVE token
+        // with the message. Ambiguous or none -> null (we park + ask, never guess).
+        const match = resolveEventByIdentity(rest, events as any[]);
 
-        // Save the link onto a matched event so the reminder can surface it,
-        // regardless of whether he also asked us to join.
+        // Attach the link to the matched event, then READ IT BACK before claiming
+        // saved (the old code trusted the PATCH ok flag and lied "saved in notes").
         let saved = false;
         if (match) {
-          saved = await fetch(`${process.env.SUPABASE_URL}/rest/v1/events?id=eq.${enc(match.id)}`, {
+          // patchedOk: this write succeeded; readBack: the row holds the link.
+          // Require BOTH (skeptic F4) so an idempotent re-send or a silently failed
+          // PATCH on an already-equal row can never claim a save this turn did.
+          const patchedOk = await fetch(`${process.env.SUPABASE_URL}/rest/v1/events?id=eq.${enc(match.id)}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json", apikey: process.env.SUPABASE_SERVICE_KEY || "", Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY || ""}` },
-            body: JSON.stringify({ meeting_url: meetingLink }),
+            body: JSON.stringify({ meeting_url: anyLink }),
           }).then((r) => r.ok).catch(() => false);
+          const check = await sbSelect<any>("events", `id=eq.${enc(match.id)}&select=meeting_url&limit=1`).catch(() => []);
+          saved = patchedOk && (check as any[])?.[0]?.meeting_url === anyLink; // claim only a write that landed
         }
 
         if (wantsJoin) {
@@ -465,9 +476,21 @@ export async function POST(req: NextRequest) {
           await sendTextAndLog(from, ack, { party: inboundParty, dev: sender.role === "developer" ? true : undefined });
           return NextResponse.json({ ok: true });
         }
+
+        // No confident existing-event match. PARK the link as a safety net (incident
+        // B: it may belong to a meeting created later; the brain's attachMeetingLink
+        // claims it on identity), then fall through to the brain.
+        // - Key on inboundParty (the role), NOT `from` (the phone): attachMeetingLink
+        //   reads by ctx.party, so the keys MUST match or the park is orphaned (F1).
+        // - Only park when there is a real meeting signal — a joinable platform link
+        //   or an explicit join intent. A bare article URL must not pollute the
+        //   buffer or hijack this path (F3); it falls straight through to the brain.
+        if (meetingLink || JOIN_INTENT_RE.test(rest)) {
+          await parkLink(inboundParty, anyLink, text);
+        }
       } catch {}
-      // Link with no join intent and no event match: let the brain handle it
-      // (it will respond naturally). Fall through to runConcierge below.
+      // Link with no join intent and no confident event match: parked above, now
+      // let the brain handle it (create the meeting / respond). Fall through.
     }
 
     // Wall 1 of "fragment match without anchor" (2026-06-16, KT #293). When the

@@ -52,6 +52,30 @@ export async function rememberFact(fact: string, opts?: { source?: string; kind?
 export async function rememberDirective(text: string): Promise<void> {
   await rememberFact(text, { kind: "directive", source: "user" });
 }
+
+// Email -> brain (so a later reference resolves: "what did Khalid email about",
+// "the contract he sent"). Pure fact-formatter (testable); content is what makes
+// recall useful, so we keep the body/snippet, not just the 14-word triage summary.
+export function emailFactText(m: { from?: string; fromEmail?: string; subject?: string; date?: string; body?: string }): string {
+  const who = [m.from, m.fromEmail && m.fromEmail !== m.from ? `<${m.fromEmail}>` : ""].filter(Boolean).join(" ");
+  const when = m.date ? ` on ${m.date}` : "";
+  const subj = m.subject ? ` re "${m.subject}"` : "";
+  // Full awareness: keep the whole body up to the embed window (tryEmbed slices
+  // to 4000), so a long contract/brief is remembered in full, not gutted to a
+  // preview. zanii-codef: cap = embed cap; raise both together if we ever embed
+  // longer.
+  const body = String(m.body || "").replace(/\s+/g, " ").trim().slice(0, 3800);
+  return `Email from ${who || "unknown sender"}${when}${subj}: ${body}`.slice(0, 4000);
+}
+
+// Persist an email the owner saw. subject-column = sender so recall by person
+// works. Deduped + best-effort via rememberFact. Caller skips noise (Q4).
+export async function rememberEmail(m: { from?: string; fromEmail?: string; subject?: string; date?: string; body?: string }): Promise<void> {
+  const fact = emailFactText(m);
+  if (fact.length < 30) return;
+  await rememberFact(fact, { source: "email", subject: m.from || m.fromEmail || undefined }).catch(() => {});
+}
+
 export async function listDirectives(): Promise<string[]> {
   const rows = await sbSelect<any>("brain_facts", `status=eq.active&kind=eq.directive&order=created_at.asc&select=fact`).catch(() => []);
   return rows.map((r) => r.fact);

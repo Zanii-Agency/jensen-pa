@@ -234,9 +234,9 @@ check("seam: refusal observability emits dorje.discriminator_mismatch_refused", 
 
 check("seam: runAction signature accepts ctx and loop.ts threads party in", () => {
   const dsrc = read("lib/concierge/dispatch.ts");
-  if (!/export async function runAction\(name: string, input: any, ctx\?\s*:\s*\{\s*party\?\s*:\s*string\s*\}\)/.test(dsrc)) return "runAction signature missing ctx { party }";
+  if (!/export async function runAction\(name: string, input: any, ctx\?\s*:\s*\{\s*party\?\s*:\s*string;\s*lastUser\?\s*:\s*string\s*\}\)/.test(dsrc)) return "runAction signature missing ctx { party, lastUser }";
   const lsrc = read("lib/concierge/loop.ts");
-  if (!/runAction\(tu\.name, tu\.input \|\| \{\}, \{\s*party\s*\}\)/.test(lsrc)) return "loop does not thread party into runAction";
+  if (!/runAction\(tu\.name, tu\.input \|\| \{\}, \{\s*party,\s*lastUser\s*\}\)/.test(lsrc)) return "loop does not thread party + lastUser into runAction";
   return null;
 });
 

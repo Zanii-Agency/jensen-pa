@@ -12,11 +12,51 @@ import { aggregateInbox, readUnified, sendUnified, unpackId, sendMeetingInviteEm
 import { dubaiLocalToUtc } from "../ics";
 import { searchDocsWithClaude } from "../docs-server";
 import { enrichDraftContext } from "../mail-draft-context";
+
+// Zanii proof-of-action: every tool EXCEPT pure reads emits a receipt under its
+// own name (target = the tool). Deny-list (not allow-list) so new action tools
+// are covered by default; only reads/queries/computations are excluded.
+const ZANII_READS = new Set([
+  "list_contacts", "list_documents", "list_entities", "list_finance", "list_inbox",
+  "list_memory", "list_notes", "list_tasks", "query_calendar", "query_memory",
+  "find_contact", "find_entity", "read_email", "read_owner_chats", "search_documents",
+  "search_email", "get_settings", "entity_dashboard", "finance_summary", "morning_brief",
+  "vat_report", "ct_estimate",
+]);
+
+// PARTY WALL ON PERSISTENT WRITES (Law 9 single-tenant + Law 10 test-mode).
+// Jensen's board / brief / portal render every row of these tables verbatim, so a
+// task/event/etc. created in a Taona (admin/dev/test) turn leaks into the client's
+// world. On 2026-07-22 three of Taona's own dev tasks ("Evaluate Agent-Reach",
+// "Vibe-Trading", "Trading ledger") were sitting in Jensen's board this way. The
+// codebase already walls Taona out of Jensen's auto-captured memory (loop.ts:
+// captureSalience runs for party==="jensen" only); this extends the SAME wall to
+// tool writes, which had no such guard. A non-jensen turn gets a simulated result
+// (dev sees what would have happened) and NOTHING persists to Jensen's tenant.
+// Real changes to Jensen's data go through Jensen's own authenticated portal.
+const TENANT_WRITES = new Set<string>([
+  "create_entity", "update_entity", "delete_entity",
+  "create_task", "send_task_to_peer", "update_task", "complete_task", "delete_task", "accept_meeting_tasks",
+  "create_event", "update_event", "delete_event", "complete_event",
+  "record_finance", "update_finance", "delete_finance",
+  "file_document", "delete_document",
+  "set_legal_blueprint",
+  "add_contact", "update_contact", "delete_contact",
+  "add_note", "delete_note",
+  "remember_fact", "remember_preference", "forget_memory",
+  "update_prefs", "set_goals",
+]);
+// True when this write must be walled off: a real persistent write to Jensen's
+// tenant requested by anyone other than Jensen himself.
+export function skipTenantWriteForDev(name: string, party?: string): boolean {
+  return !!party && party !== "jensen" && TENANT_WRITES.has(name);
+}
 import { kvGet } from "../db";
 import { sbSelect, enc } from "./rest";
 import { sendWhatsAppDocument, devPhone, whoIs } from "../whatsapp";
 import { signedReceiptUrl } from "../storage";
 import { meetingUrlForWrite } from "../digital-u";
+import { takeParkedLinkFor } from "../pending-links";
 import { selectProposedTasks } from "./meeting-proposal.mjs";
 
 type Result = any;
@@ -104,7 +144,14 @@ async function attachMeetingLink(ctx: { party?: string } | undefined, input: any
     if (!ctx?.party) return;
     const last = await jensenDiscriminatorAdapters(ctx).getLastUserInbound();
     const url = meetingUrlForWrite(undefined, String(last || ""));
-    if (url) input.meetingUrl = url;
+    if (url) { input.meetingUrl = url; return; }
+    // No link in this message. A link may have been PARKED earlier for this exact
+    // meeting (incident B: link sent before the event existed). Claim it now, only
+    // if the parked link's original message identity-names this event's title.
+    if (input?.title) {
+      const parked = await takeParkedLinkFor(ctx.party, String(input.title));
+      if (parked) input.meetingUrl = parked;
+    }
   } catch { /* best-effort; never block the write */ }
 }
 
@@ -155,16 +202,41 @@ const DESTRUCTIVE = new Set([
   "sanad_draft_contract",
 ]);
 
-function destructiveGate(name: string, input: any): { ok: boolean; error?: string } | null {
+// A genuine affirmation FROM THE OWNER (not the model). Bounded so "yesterday"
+// and the like never match; negations ("no, don't") never match.
+const CONFIRM_RE = /\b(yes+|yep|yeah|yup|ya|okay|ok|k|sure|fine|correct|right|absolutely|100%?|confirm|confirmed|go ahead|go for it|do it|do that|send it|delete it|please do|that'?s right|approved)\b|👍/i;
+export function isConfirmation(text: string): boolean {
+  // Skeptic #6: a coalesced burst joins lines with "\n"; the owner's FINAL line
+  // governs. "yes\nactually wait no" must read as the reversal, not the yes.
+  const lines = String(text || "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const t = lines[lines.length - 1] || "";
+  if (!t) return false;
+  if (/\b(no|don'?t|do not|cancel|stop|wait|not yet|never ?mind)\b/i.test(t) && !/\b(yes|confirm|go ahead|do it)\b/i.test(t)) return false;
+  return CONFIRM_RE.test(t);
+}
+
+// C1 FIX (was self-gatable): a destructive/outbound tool no longer executes on a
+// model-supplied `confirm:true` — the model could set that itself with no real
+// approval. Confirmation must be the OWNER'S ACTUAL last inbound being a yes. The
+// model cannot forge the owner's message, so it can only get here after genuinely
+// asking and the owner genuinely confirming. The model's confirm field is ignored.
+// (_confirmed is reserved for a future server-set deterministic execute path.)
+export function isDestructive(name: string): boolean {
+  return DESTRUCTIVE.has(name);
+}
+
+function destructiveGate(name: string, input: any, lastUser: string): { ok: boolean; error?: string } | null {
   if (!DESTRUCTIVE.has(name)) return null;
-  const confirmed = input?.confirm === true || input?._confirmed === true;
-  if (confirmed) return null;
+  const serverConfirmed = input?._confirmed === true; // server-set only, never the model
+  const ownerConfirmed = isConfirmation(lastUser);
+  if (serverConfirmed || ownerConfirmed) return null;
   return {
     ok: false,
     error:
-      `Destructive tool '${name}' refused without explicit confirmation. ` +
+      `Destructive tool '${name}' refused: the owner has not confirmed. ` +
       `JENSEN-DOCTRINE Law 8: write tools never run inline. ` +
-      `Ask the user a clear yes/no confirmation ('Delete X? Reply yes to confirm'), wait for their answer, then retry this tool with confirm:true.`,
+      `Ask a clear yes/no ('Delete X? Reply yes to confirm') and wait. The action ` +
+      `runs only when the owner's own next message is a yes (a confirm:true flag is ignored).`,
   };
 }
 
@@ -255,10 +327,16 @@ const GEN_SYS = (kind: string) =>
 const LEGAL_SYS = (kind: string, blueprint: string) =>
   `You are Rencontre, drafting a UAE ${kind} for Jensen / La Rencontre. Ground it in this legal blueprint where relevant:\n${blueprint || "(no blueprint saved yet; use sensible UAE defaults and flag where Jensen must fill specifics)"}\nDraft a clear, professional document under Dubai/UAE law. Add a short note that a UAE lawyer should review before signing. ${NO_DASHES} Output the document body only.`;
 
-export async function runAction(name: string, input: any, ctx?: { party?: string }): Promise<{ ok: boolean; result?: Result; error?: string }> {
+export async function runAction(name: string, input: any, ctx?: { party?: string; lastUser?: string }): Promise<{ ok: boolean; result?: Result; error?: string }> {
   try {
-    const gated = destructiveGate(name, input);
+    const gated = destructiveGate(name, input, ctx?.lastUser || "");
     if (gated) return gated;
+    // Party wall: a non-Jensen (admin/dev/test) turn never persists to Jensen's
+    // tenant. Return a simulated result so the model can tell the operator what it
+    // WOULD have done, without polluting the client's board / brief / portal.
+    if (skipTenantWriteForDev(name, ctx?.party)) {
+      return { ok: true, result: { simulated: true, tool: name, persisted: false, note: "Dev/admin turn: not written to Jensen's tenant (single-tenant wall). Change Jensen's real data through his own portal." } };
+    }
     let result: Result;
     switch (name) {
       // entities
@@ -280,6 +358,23 @@ export async function runAction(name: string, input: any, ctx?: { party?: string
             if (owner) sendTextAndLog(owner, `Heads up. I just added *${result.title}* to your Q1. It is marked urgent.`, { force: true, party: "jensen" }).catch(() => {});
           } catch {}
         }
+        break;
+      }
+      case "send_task_to_peer": {
+        // ADR-0015 cross-bot delegate. Record on Jensen's board (the id is the
+        // correlation key for status-backs), then push ONLY the allowlisted fields
+        // to Taona's bot. Honest: if the bridge is off or unreachable, we say so
+        // and never claim it reached Taona (the honesty rail surfaces the summary).
+        const { peerSyncEnabled, toPeerPayload, sendTaskToPeer } = await import("@/lib/peer-sync");
+        const created: any = await ops.createTask({ title: String(input.title || ""), due: input.due, quadrant: 3 });
+        const correlationId = created?.id;
+        if (!peerSyncEnabled() || !correlationId) {
+          return { ok: false, error: `Saved *${input.title}* to your board. Sending tasks to Taona is not switched on yet, so it did not go to him.` };
+        }
+        const r = await sendTaskToPeer(toPeerPayload({ title: String(input.title || ""), due: input.due ?? null, status: "open", correlationId }));
+        if (r.skipped) return { ok: false, error: `Saved *${input.title}* to your board. The link to Taona's bot is not configured yet, so it did not go to him.` };
+        if (!r.ok) return { ok: false, error: `Saved *${input.title}* to your board, but I could not reach Taona's bot just now, so I have not sent it to him. I will not say it reached him.` };
+        result = { ok: true, sent_to: "Taona", title: String(input.title || ""), correlation_id: correlationId } as any;
         break;
       }
       case "update_task": {
@@ -534,6 +629,16 @@ export async function runAction(name: string, input: any, ctx?: { party?: string
       case "sanad_draft_contract": { result = await ops.sanadStartDraft(input); break; }
       case "sanad_review_contract": { result = await ops.sanadReview(input); break; }
       default: return { ok: false, error: `unknown tool ${name}` };
+    }
+    // One door: every non-read tool emits its Zanii receipt here, by tool name.
+    // Payload is hashed (only a fingerprint hits the ledger). ok is earned from
+    // the tool's own result. Fire-and-forget (waitUntil keeps it alive on Vercel).
+    if (!ZANII_READS.has(name)) {
+      const actionOk = result?.ok !== false && result?.sent !== false;
+      // Dynamic import keeps the ESM-only @zanii/sdk out of dispatch's static
+      // graph (the eval loader flips to strict-ESM and breaks extensionless
+      // imports otherwise). Fire-and-forget; waitUntil inside keeps it alive.
+      import("../zanii").then(({ recordAction }) => recordAction(name, { input: input ?? {}, ok: actionOk })).catch(() => {});
     }
     return { ok: true, result };
   } catch (e: any) {
