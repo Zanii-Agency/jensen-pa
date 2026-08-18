@@ -263,6 +263,18 @@ export async function POST(req: NextRequest) {
          msg.document ? `[document: ${msg.document.filename || "file"}]` :
          "[message]");
       mirrorInbound(inboundSummary, from).catch(() => {});
+      // Signed proof-of-action (inbound): the operator sent Jensen a message. The
+      // media type rides on the target so a sent pdf, image, voice note, or shared
+      // link reads distinctly on the proof layer instead of collapsing into one
+      // receipt. Owner-only (Law 3: no guest PII on the ledger); payload hashed.
+      const inKind = msg.image ? "image"
+        : msg.document ? (/pdf/i.test(String(msg.document.mime_type || msg.document.filename || "")) ? "pdf" : "document")
+        : msg.voice ? "voice"
+        : msg.audio ? "audio"
+        : /https?:\/\/\S+/i.test(String(msg.text?.body || "")) ? "link"
+        : "text";
+      import("@/lib/zanii").then(({ recordAction }) =>
+        recordAction(`concierge.from_operator.${inKind}`, { from, kind: inKind })).catch(() => {});
     }
     const history = await recentHistory(sender.role !== "owner" ? "taona" : "jensen");
     // Voice notes arrive as msg.voice (push-to-talk) or msg.audio (uploaded audio).
