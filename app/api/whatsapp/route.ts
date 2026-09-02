@@ -198,6 +198,12 @@ export async function POST(req: NextRequest) {
     // Non-text types pass empty so "this"/"here" text is not confused with
     // "[voice note]" stub content.
     const textBody = msg.text?.body?.trim() || "";
+    // hasMedia exempts an actual media webhook (image/document/video/voice/audio/
+    // sticker) from the per-sender 2s lock: two DISTINCT images sent seconds apart
+    // carry distinct wamids, so the wamid dedup already catches a true re-delivery,
+    // and the lock would only drop the second real file (Stalia 2026-09-01: portal
+    // screenshot then bank proof, second lost). Same media set as the early-save above.
+    const hasMedia = Boolean(msg.image || msg.document || msg.video || msg.voice || msg.audio || msg.sticker);
     const guard = await shouldProcess("jensen", from, msg.id, textBody, {
       seenByWamid: async (id: string) => { const s = await seen(id); return s; },
       logToChat: async (sender: string, t: string) => {
@@ -214,7 +220,7 @@ export async function POST(req: NextRequest) {
         } catch { /* fall through to save (never drop a message) */ }
         await ops.chatAppend("user", t, "whatsapp", party).catch(() => {});
       },
-    });
+    }, { hasMedia });
     if (guard.action !== "process") return NextResponse.json({ ok: true });
 
     // MAINTENANCE GATE. While JENSEN_MODE=TRAINING:
