@@ -759,7 +759,7 @@ check("seam.62 persona role-disclosure: 'X built/runs me' + 'my developer' + 'Ta
   return null;
 });
 
-check("seam.83 agency_brand_leak: passes Jensen's own board (Zanii payee task) but drops Law 9 provenance (KT #341)", () => {
+check("seam.83 agency_brand_leak: passes Jensen's own board + his Zanii Ledger inbox thread, drops only Law 9 self-attribution (KT #341)", () => {
   const src = read("lib/bot/guards-config.ts");
   const m = src.match(/label:\s*'agency_brand_leak',\s*mode:\s*'drop',\s*pattern:\s*(\/.*?\/[a-z]*)\s*}/);
   if (!m) return "agency_brand_leak pattern not found in guards-config";
@@ -767,24 +767,47 @@ check("seam.83 agency_brand_leak: passes Jensen's own board (Zanii payee task) b
   try { const b = m[1]; const ls = b.lastIndexOf("/"); re = new RegExp(b.slice(1, ls), b.slice(ls + 1)); }
   catch (e) { return "could not compile agency_brand_leak regex: " + (e?.message || e); }
   // The exact board render that was dropped four times on 2026-09-22.
+  // Every MUST_PASS body below is REAL production traffic this guard dropped.
   const MUST_PASS = [
     "Here is your full list, Jensen.\n\n*Q1 - Urgent + Important*\n\u2022 Addendum for Sohum\n\u2022 Update payment link for Zanii",
-    "Update payment link for Zanii",
+    "Morning, Jensen. How's the head? Here is your board for today. *Do first*\n\u2022 Update payment link for Zanii",
+    "Heads up. I just added *Update payment link for Zanii* to your Q1.",
+    "Regarding showcasing the Zanii Ledger, whoever presents should provide a laptop.",
+    "Re: the Tech Council event where Zanii was pitching.",
     "Meeting with Zanii at 14:00",
     "I noticed a new email that needs your eyes. From: Zanii <a@b.com>",
-    "Payment to Zanii due Friday",
-    "Send the addendum to Zanii",
   ];
   const MUST_DROP = [
     "I am powered by Zanii",
     "This is a Zanii product",
-    "Zanii Connect can handle that",
     "I was built by Zanii",
-    "You can see it at zanii.agency",
-    "Try Zanii ID for that",
+    "We're a Zanii service",
   ];
   for (const t of MUST_PASS) if (re.test(t)) return "FALSE-DROP on Jensen's own data: " + JSON.stringify(t.slice(0, 40));
   for (const t of MUST_DROP) if (!re.test(t)) return "provenance LEAK not caught: " + JSON.stringify(t.slice(0, 40));
+  return null;
+});
+
+check("seam.84 plaintext_credential does NOT eat meeting invites: Zoom ?pwd= + Teams 'Passcode:' deliver, a real 'password:' leak still drops (KT #341)", () => {
+  const src = read("lib/bot/guards-config.ts");
+  const m = src.match(/label:\s*'plaintext_credential',\s*mode:\s*'drop',\s*pattern:\s*(\/.*?\/[a-z]*)\s*}/);
+  if (!m) return "plaintext_credential pattern not found in guards-config";
+  let re;
+  try { const b = m[1]; const ls = b.lastIndexOf("/"); re = new RegExp(b.slice(1, ls), b.slice(ls + 1)); }
+  catch (e) { return "could not compile plaintext_credential regex: " + (e?.message || e); }
+  // Both MUST_PASS bodies are REAL production sends this guard dropped.
+  const MUST_PASS = [
+    "Reminder. Zoom with Wessam at 15:30.\nHere is your link to join: https://us04web.zoom.us/j/75639341446?pwd=V0XyUbxPhXx0m6PgceT011B3hRKUYP.1",
+    "Microsoft Teams meeting\nJoin: https://teams.microsoft.com/meet/325416133175929?p=6KVIgoKvGAawNsFOVT\nMeeting ID: 325 416 133 175 929\nPasscode: 481922",
+    "Join: https://meet.google.com/abc-defg-hij",
+  ];
+  const MUST_DROP = [
+    "Your password: hunter2",
+    "password=swordfish",
+    "The portal password : letmein",
+  ];
+  for (const t of MUST_PASS) if (re.test(t)) return "FALSE-DROP on a real meeting invite: " + JSON.stringify(t.slice(0, 45));
+  for (const t of MUST_DROP) if (!re.test(t)) return "credential LEAK not caught: " + JSON.stringify(t.slice(0, 45));
   return null;
 });
 

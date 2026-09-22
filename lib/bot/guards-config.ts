@@ -24,7 +24,15 @@ export const JENSEN_BOT_GUARDS_CONFIG = defineBotConfig({
   // "Password: ..." over WhatsApp. Law 5 (dashes) stays upstream in stripDashes.
   bannedPatterns: [
     // Credentials must never traverse the client channel (Law 3).
-    { label: 'plaintext_credential', mode: 'drop', pattern: /\b(password|passcode|pwd)\b\s*[:=]\s*\S+/i },
+    // NARROWED 2026-09-22. This fired three times in production and every fire was
+    // a FALSE DROP of a real meeting invite: two Teams invites ("Passcode: ...",
+    // 09-Jul + 14-Jul) and a Zoom join link six minutes before the call
+    // ("?pwd=..." in the URL, 08-Sep, "Reminder. Zoom with Wessam at 15:30").
+    // Every Zoom URL carries pwd=, so Jensen could not receive a Zoom link at all.
+    // 'passcode' is the MEETING word and is dropped from the alternation; the
+    // lookbehind exempts a pwd that is a URL query parameter. The Jun-18 incident
+    // this guard exists for said "Password: ..." and is still covered.
+    { label: 'plaintext_credential', mode: 'drop', pattern: /(?<![?&])\b(password|pwd)\b\s*[:=]\s*\S+/i },
     { label: 'login_credential', mode: 'drop', pattern: /\blogin\b\s*[:=]\s*\S+/i },
     // Internal/infra narration must never reach the client (Law 1 persona).
     { label: 'infra_api_token', mode: 'drop', pattern: /\bapi[\s-]?(key|token)s?\b/i },
@@ -51,7 +59,14 @@ export const JENSEN_BOT_GUARDS_CONFIG = defineBotConfig({
     // a vendor Jensen pays. Scoped to product-suite + attribution framing so his own
     // references flow. `persona_self_disclosure` below already covers "<X> built/runs
     // me" name-independently, so this does not need loose verb proximity.
-    { label: 'agency_brand_leak', mode: 'drop', pattern: /\bzanii[\s.]?(agency|ai|id|connect|proof|ledger|orbit|folio|realty|meezan|seal)\b|\b(a|an|the|our|this|another)\s+zanii\s+(product|tool|service|platform|system|app|bot|assistant|agent|stack|suite|brand)\b|\b(powered|built|made|created|developed|designed|operated|maintained|provided|run|hosted|licensed|supplied)\s+(by|through|on)\s+(the\s+)?zanii\b/i },
+    // NARROWED 2026-09-22 after reading Jensen's actual traffic: his inbox carries
+    // a Meta thread about "showcasing the Zanii Ledger" at a Tech Council event he
+    // is involved in, and his board carries "Update payment link for Zanii". Zanii
+    // is a counterparty and a topic he already knows, so product names and the
+    // domain are CLIENT DATA here, not a leak. Only self-attribution is a Law 9
+    // breach, and `persona_self_disclosure` below already covers the name-free
+    // shapes ("<X> built/runs me").
+    { label: 'agency_brand_leak', mode: 'drop', pattern: /\b(powered|built|made|created|developed|designed|operated|maintained|run|hosted|licensed|supplied)\s+(by|through|on)\s+(the\s+)?zanii\b|\b(i am|i'm|we are|we're|this is)\s+(an?\s+)?zanii\b|\b(a|an|this)\s+zanii\s+(product|tool|service|platform|assistant|agent|bot)\b/i },
     // Self-referential persona break (KT #340): the real secret is not the NAME
     // "Taona" (Jensen knows him, has "Meeting with Taona" on his calendar) — it is
     // the bot ADMITTING a human built or runs it. This catches "<verb> me / this
