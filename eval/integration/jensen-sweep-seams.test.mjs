@@ -552,13 +552,16 @@ check("seam.31 health_checks migration exists with correct schema", () => {
   return null;
 });
 
-check("seam.46 Class A leakage wall: brand bans (zanii/sanad) present; Taona moved to scoped dev_persona_leak (KT #340)", () => {
+check("seam.46 Class A leakage wall: sanad ban present; Taona + zanii moved to scoped drop patterns (KT #340/#341)", () => {
   const src = read("lib/bot/guards-config.ts");
   const i = src.indexOf("forbiddenBrands:");
-  const set = src.slice(i, i + 1100);
-  for (const b of ["'zanii'", "'sanad'"]) {
+  const set = src.slice(i, i + 1600);
+  for (const b of ["'sanad'"]) {
     if (!set.includes(b)) return `${b} not in forbiddenBrands (would leak to the client)`;
   }
+  // 'zanii' must NOT be a bare forbidden brand anymore (it dropped Jensen's own board)
+  if (/^\s*'zanii',/m.test(set)) return "'zanii' is still a bare forbidden brand (drops Jensen's own 'payment link for Zanii' board)";
+  if (!/label:\s*'agency_brand_leak'[^}]*mode:\s*'drop'/.test(src)) return "agency_brand_leak pattern missing or not in drop mode (Law 9 provenance would reopen)";
   // 'Taona' must NOT be a bare forbidden brand anymore (it dropped Jensen's own board)
   if (/^\s*'Taona',/m.test(set)) return "'Taona' is still a bare forbidden brand (drops Jensen's own 'contract for Taona' board)";
   // but the dev/persona leak protection must remain, as a scoped drop pattern
@@ -689,13 +692,15 @@ check("seam.57 honesty rail exempts a recap/summary read (does not eat it into '
 check("seam.59 brand wall does not drop a real client contact: 'Stephen' removed (collides with 'Stephen Sutherland'), dev/brand bans kept", () => {
   const src = read("lib/bot/guards-config.ts");
   const i = src.indexOf("forbiddenBrands:");
-  const set = src.slice(i, i + 1100);
+  const set = src.slice(i, i + 1600);
   // the bare 'Stephen' entry must be gone from the active list (a comment mention is fine)
   if (/^\s*'Stephen',/m.test(set)) return "'Stephen' is still an active forbidden brand (drops replies about the real contact Stephen Sutherland)";
   // 'Taona' also removed as a bare brand (KT #340 — collided with Jensen's own board)
   if (/^\s*'Taona',/m.test(set)) return "'Taona' is still an active bare forbidden brand (drops Jensen's own board)";
   // but the genuine brand protections must remain
-  for (const b of ["'zanii'", "'sanad'", "'Sasa'"]) {
+  // 'zanii' also removed as a bare brand (KT #341 — collided with Jensen's own board)
+  if (/^\s*'zanii',/m.test(set)) return "'zanii' is still an active bare forbidden brand (drops Jensen's own board)";
+  for (const b of ["'sanad'", "'Sasa'"]) {
     if (!set.includes(b)) return `${b} was wrongly removed from forbiddenBrands`;
   }
   return null;
@@ -751,6 +756,35 @@ check("seam.62 persona role-disclosure: 'X built/runs me' + 'my developer' + 'Ta
   ];
   for (const s of PASS) if (hit(s)) return "FALSE-DROP on legit text: " + JSON.stringify(s.slice(0, 40));
   for (const s of DROP) if (!hit(s)) return "persona role-disclosure LEAK not caught: " + JSON.stringify(s.slice(0, 40));
+  return null;
+});
+
+check("seam.83 agency_brand_leak: passes Jensen's own board (Zanii payee task) but drops Law 9 provenance (KT #341)", () => {
+  const src = read("lib/bot/guards-config.ts");
+  const m = src.match(/label:\s*'agency_brand_leak',\s*mode:\s*'drop',\s*pattern:\s*(\/.*?\/[a-z]*)\s*}/);
+  if (!m) return "agency_brand_leak pattern not found in guards-config";
+  let re;
+  try { const b = m[1]; const ls = b.lastIndexOf("/"); re = new RegExp(b.slice(1, ls), b.slice(ls + 1)); }
+  catch (e) { return "could not compile agency_brand_leak regex: " + (e?.message || e); }
+  // The exact board render that was dropped four times on 2026-09-22.
+  const MUST_PASS = [
+    "Here is your full list, Jensen.\n\n*Q1 - Urgent + Important*\n\u2022 Addendum for Sohum\n\u2022 Update payment link for Zanii",
+    "Update payment link for Zanii",
+    "Meeting with Zanii at 14:00",
+    "I noticed a new email that needs your eyes. From: Zanii <a@b.com>",
+    "Payment to Zanii due Friday",
+    "Send the addendum to Zanii",
+  ];
+  const MUST_DROP = [
+    "I am powered by Zanii",
+    "This is a Zanii product",
+    "Zanii Connect can handle that",
+    "I was built by Zanii",
+    "You can see it at zanii.agency",
+    "Try Zanii ID for that",
+  ];
+  for (const t of MUST_PASS) if (re.test(t)) return "FALSE-DROP on Jensen's own data: " + JSON.stringify(t.slice(0, 40));
+  for (const t of MUST_DROP) if (!re.test(t)) return "provenance LEAK not caught: " + JSON.stringify(t.slice(0, 40));
   return null;
 });
 

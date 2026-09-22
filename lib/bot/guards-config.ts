@@ -43,6 +43,15 @@ export const JENSEN_BOT_GUARDS_CONFIG = defineBotConfig({
     // Jensen's legitimate references to Taona flow. Verified board-passes /
     // leak-drops in seam.61.
     { label: 'dev_persona_leak', mode: 'drop', pattern: /\btaona\b[^.!?\n]{0,50}\b(caught|recharged|topped\s*up|drained|deployed|debugg\w*|restarted|the bug|a bug|code bug|api|token|server|backend|fixed it|fixed the|caught it|built|created|made|runs?|operates?|maintains?|developed|designed|coded|set\s*up|wrote|programm\w*)\b|\b(caught|recharged|topped\s*up|drained|deployed|debugg\w*|restarted|fixed it|fixed the|caught it|built|created|made|runs?|operates?|maintains?|developed|designed|coded|set\s*up|wrote|programm\w*)\b[^.!?\n]{0,50}\btaona\b/i },
+    // Agency-brand provenance leak (KT #341). 'zanii' WAS a bare forbiddenBrand and
+    // collided with Jensen's OWN board ("Update payment link for Zanii") exactly the
+    // way 'Stephen' (#339) and 'Taona' (#340) did: a token that is ALSO legitimate
+    // client data cannot be a blanket drop. What Law 9 protects is PROVENANCE — the
+    // bot revealing whose product it is, or cross-selling a sibling — not the name of
+    // a vendor Jensen pays. Scoped to product-suite + attribution framing so his own
+    // references flow. `persona_self_disclosure` below already covers "<X> built/runs
+    // me" name-independently, so this does not need loose verb proximity.
+    { label: 'agency_brand_leak', mode: 'drop', pattern: /\bzanii[\s.]?(agency|ai|id|connect|proof|ledger|orbit|folio|realty|meezan|seal)\b|\b(a|an|the|our|this|another)\s+zanii\s+(product|tool|service|platform|system|app|bot|assistant|agent|stack|suite|brand)\b|\b(powered|built|made|created|developed|designed|operated|maintained|provided|run|hosted|licensed|supplied)\s+(by|through|on)\s+(the\s+)?zanii\b/i },
     // Self-referential persona break (KT #340): the real secret is not the NAME
     // "Taona" (Jensen knows him, has "Meeting with Taona" on his calendar) — it is
     // the bot ADMITTING a human built or runs it. This catches "<verb> me / this
@@ -70,7 +79,12 @@ export const JENSEN_BOT_GUARDS_CONFIG = defineBotConfig({
     // legitimately contains "Dorje contract for Taona" + "Meeting with Taona". Moved
     // to the scoped `dev_persona_leak` bannedPattern above (drops dev/infra narration
     // about Taona, passes Jensen's own references). Same lesson as 'Stephen' (KT #339).
-    'zanii',             // agency brand — Jensen is single-tenant larencontre.ae (Law 9)
+    // 'zanii' removed (KT #341): THIRD instance of #339/#340. Jensen's own Q1 board
+    // carries "Update payment link for Zanii" (Zanii is a counterparty he pays), so
+    // the bare ban dropped EVERY board render — he asked for his list four times on
+    // 2026-09-22 and got "Let me get back to you on that in a moment." each time.
+    // Moved to the scoped `agency_brand_leak` bannedPattern above. Law 9 protects
+    // PROVENANCE (whose product this is), not the string.
     'sanad',             // sibling zanii product — never surfaced to this client
   ],
 
