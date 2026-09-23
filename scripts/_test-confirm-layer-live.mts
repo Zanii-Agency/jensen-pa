@@ -4,7 +4,7 @@
 // Uses the scratch party "selftest". Nothing here can reach Jensen or execute a
 // tool: it only exercises the hold / claim / cancel records. Every row it writes
 // is deleted at the end. Exits non-zero on any failure.
-import { proposePending, findOpenHold, claimByTap, claimOnPortal, holdStatus, recentlyExecutedSame, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
+import { proposePending, findOpenHold, claimByTap, holdStatus, recentlyExecutedSame, lastExecuted, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
 import { sbSelect, sbUpdate, sbDelete } from "../lib/concierge/rest";
 
 const P = "selftest";
@@ -53,15 +53,9 @@ try {
   await cancelPending(same2!.id);
   ok((await claimByTap(same2!.id, P, "wamid.STAP")) === null, "a cancelled hold's button runs nothing");
 
-  // --- Portal: his own later bare yes, only for a portal hold ---
-  const p = await hold("delete_task", { id: "t1" }, "portal:P1", "portal");
-  ok((await claimOnPortal(p!.id, P, "portal:P1")) === null, "the proposing portal message cannot confirm itself");
-  ok((await claimByTap(p!.id, P, "wamid.PTAP")) === null, "a WhatsApp tap cannot claim a portal hold");
-  ok((await claimOnPortal(p!.id, "someone-else", "portal:P2")) === null, "another party cannot claim it");
-  const pr = await Promise.all([claimOnPortal(p!.id, P, "portal:P2"), claimOnPortal(p!.id, P, "portal:P3")]);
-  ok(pr.filter(Boolean).length === 1, "two racing portal confirmations: exactly one executes");
-  const wOnPortal = await hold("delete_task", { id: "t2" }, "wamid.WP", "whatsapp");
-  ok((await claimOnPortal(wOnPortal!.id, P, "portal:P4")) === null, "typing yes on the portal cannot confirm a WhatsApp hold");
+  // --- honest cancel: something that already ran is reported as run ---
+  ok((await lastExecuted(P))?.id === w!.id, "the last action that actually ran is findable, so 'cancel' can say it already happened");
+  // (the portal no longer holds anything: dispatch refuses deletes and sends there)
 } finally {
   await sbDelete("kv", scratch);
   const left = await sbSelect("kv", `select=key&${scratch}`);

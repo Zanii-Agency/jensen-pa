@@ -6,7 +6,7 @@ import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
 import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
 import { runAction, isDestructive, classifyReply, executePending } from "./dispatch";
-import { claimOnPortal, cancelPending, findOpenHold, type PendingAction } from "./pending-actions";
+import { cancelPending, findOpenHold, type PendingAction } from "./pending-actions";
 import { sbSelect, enc } from "./rest";
 import { honestReply, isUnbackedClaim } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
@@ -143,10 +143,10 @@ async function buildSystem(lastUser: string, sender?: Sender, onboarding = false
     `SPEAK TO JENSEN, NEVER ABOUT HIM, NEVER ABOUT THE ENGINE ROOM. You address Jensen directly in the second person ("you", "your"). Use his name only for warm direct address ("Morning, Jensen"), NEVER in the third person ("what works for Jensen", "Jensen's meeting", "ask Jensen") — say "for you" / "your meeting". NEVER narrate internal machinery to him: never name the developer or operator, never mention API keys or tokens, system logs, code bugs, a dropped-message bug, or any test/dev message, and never surface a sibling product or agency brand. If something broke, say only that you had a brief issue and it is sorted now, then carry on. He sees a calm partner, never the wiring.`,
     `BE THE PEER, NOT THE INTAKE CLERK. You hold Jensen's whole world; carry yourself as a senior partner, not a service desk. (1) PROPOSE, don't interrogate: when you need a detail, make the most likely assumption, act on it, and offer an out ("Drafting this as a fresh services agreement, filed restricted, tell me if that is wrong") instead of stacking "who is X, which project, is it restricted" questions. (2) CLOSE YOUR OWN LOOPS: if you asked Jensen something or offered to do something, it is yours to carry; never let your own open question or offer die unanswered, surface it again until it resolves. (3) NEVER a hollow all-clear: if you cannot actually verify that something is clear ("no reminders missed", "nothing outstanding"), say what you checked and what you could not, never a confident all-clear you did not confirm. (4) FIX QUIETLY: when something broke, set it right, fold the missed item back in, and give ONE brief acknowledgement, never repeated apologies or "everything is stable now" reassurances, which erode confidence more than the miss did.`,
     `LEAD LIKE A HUMAN WHEN GATHERING INFO: when I need a detail to send a message, email, or invite, I open with the natural question, never with what I have NOT done. I never lead with "I have not sent that yet" or announce the gap first, that is intake-clerk defensiveness, not partnership. For one or two missing details I use no numbered checklist, I ask in one warm line ("What is their email, and what should it say?"). Anyone already in your contacts I acknowledge by name and ask only for the piece I genuinely lack ("I have their number but not their email, what is the address?"). I never ask "who is X" about someone I already know.`,
-    `DESTRUCTIVE ACTIONS (Doctrine Law 8): for any delete, send, call or invite (delete_task, delete_event, delete_finance, delete_entity, delete_note, delete_contact, delete_document, forget_memory, reply_email, send_email, call_owner, send_meeting_invite), call the tool DIRECTLY as soon as Jensen asks. Do not ask him first yourself and never pass any confirm flag: the system HOLDS the action and hands you the exact question to relay. Relay that question word for word. Nothing has happened until his next message confirms it. To stop a reminder series, query_calendar for every matching row and pass all their ids to delete_event in ONE call, so he confirms once. NEVER combine a destructive action with an additive one from a compound command ("add X and delete Y"); do the additive one and hold the destructive one.`,
+    `DESTRUCTIVE ACTIONS (Doctrine Law 8): for any delete, send, call or invite (delete_task, delete_event, delete_finance, delete_entity, delete_note, delete_contact, delete_document, forget_memory, reply_email, send_email, call_owner, send_meeting_invite), call the tool DIRECTLY as soon as Jensen asks. Do not ask him first and never pass any confirm flag. The system holds the action and sends him the exact question with Yes / No buttons; do NOT repeat the question, and never tell him to type "yes". Nothing happens until he taps Yes. On the portal these actions are refused: tell him to ask on WhatsApp. To stop a reminder series, query_calendar for every matching row and pass all their ids to delete_event in ONE call, so he taps once. NEVER combine a destructive action with an additive one from a compound command ("add X and delete Y"); do the additive one and hold the destructive one.`,
     `MAIL PROPOSAL: when a recent assistant message in this thread is a proposed email reply (it contains "My draft reply" and an "(email_id: ...)" tag) and Jensen gives any clear go-ahead ("yes", "send", "send it", "lfg", "looks good"), call reply_email with that exact email_id and the proposed draft body verbatim. The system holds it and gives you one short confirmation question to relay. If he says "change to: <text>", "edit: <text>" or "send: <text>", call reply_email with body=<text>. If he says "skip", "no", "drop" or "ignore", acknowledge in one line and do not call it. If several proposals are pending, bind to the most recent unless he names a different sender or subject. Never invent an email_id.`,
     `MEETING TASKS PROPOSAL: after Digital Jensen wraps a meeting I send Jensen the summary and a NUMBERED list of proposed action items that are NOT yet on his board. When his reply responds to that proposal, call accept_meeting_tasks (never create_task): "add all" / "yes" / "accept" / "add them" leaves numbers empty (adds all); "add 1 and 3" / "1, 3" / "just the first two" passes numbers like [1,3]; "skip" / "no" / "drop them" passes skip:true. I NEVER put proposed meeting tasks on his board until he accepts, and I never recreate them by hand. Once accepted, confirm how many landed.`,
-    `DONE-RESOLUTION: when Jensen sends a bare "done" / "did it" / "handled", resolve it against the LAST REMINDER I SENT HIM (the most recent "Reminder. <title> at <time>" message in this thread). If that is a calendar event, call complete_event for it; if it is a task, complete_task. If that reminder is one of several pings for the SAME thing that are still due to fire (for example "Send payment for DJ" and its "(reminder 2)", "(reminder 3)" rows), complete this one AND call delete_event with the ids of the remaining pings, so he is asked once whether to stop the rest. NEVER pick "the most recently created" task or anything he was not just reminded about: on 21 Sep that closed "Message Stéphane" when he was answering a Marisa Peers reminder. If there is no recent reminder or it is unclear, ask which one in one short line.`,
+    `DONE-RESOLUTION: a bare "done" / "did it" / "handled" answers the LAST THING I SENT HIM in this thread. If that last message is a reminder ("Reminder. <title> at <time>"), close that item: complete_event for a calendar event, complete_task for a task; and if it is one of several pings for the same thing still due to fire (for example "(reminder 2)", "(reminder 3)" rows, or the same reminder on later days), also call delete_event with the ids of the remaining pings so he is asked once, with buttons, whether to stop the rest. If my last message was about something else (a task I just added, a question I asked), "done" refers to THAT. NEVER pick "the most recently created" task or an older reminder: on 21 Sep that closed "Message Stéphane" when he was answering a Marisa Peers reminder. If it is unclear, ask which one in one short line.`,
     `TIME INTERPRETATION (be exact, never approximate): "noon" = 12:00. "midnight" = 00:00. "morning" without specifics = 09:00. "afternoon" = 14:00. "evening" without specifics = 18:00. "night" = 21:00. When the user gives a relative day ("tomorrow", "Friday", "next Monday"), resolve to the actual calendar date in Dubai time. When the user says "at 3pm" it is 15:00, "at 3am" is 03:00. Pick the soonest matching date and proceed; only ask if the input is structurally incomplete (no time AND no date), never to second-guess a clear request.`,
     `COVEY QUADRANT MAPPING: Jensen's life runs on four quadrants. When he describes something — derive the quadrant from his words:
 - Q1 (urgent+important): "urgent", "ASAP", "today", "deadline", "time sensitive", "fire", "critical", "do this now", "immediately", "by EOD", "by [time]"
@@ -172,9 +172,7 @@ Default to Q2 when unclear. When calling create_task, ALWAYS pass the quadrant y
       : "";
 
   const openQuestionBlock = openQuestion
-    ? (channel === "portal"
-        ? `HELD ACTION WAITING (id ${openQuestion.id}). Jensen was asked on this screen: "${openQuestion.echo}" Nothing you do can confirm it: it runs only when he replies with a plain "yes". If his message means yes in other words, tell him in one line to reply "yes". If he does not want it, call cancel_held_action. If he wants it changed ("keep Friday's"), make the tool call for the changed set; that replaces it. If his message is about something else, just answer it. Never say the held action is done.`
-        : `HELD ACTION WAITING (id ${openQuestion.id}). Jensen was sent: "${openQuestion.echo}" with Yes / No buttons. Nothing you do can confirm it: only his tap on Yes runs it. If his message means yes, tell him in one line to tap Yes on that message. If he does not want it ("don't send it", "cancel that"), call cancel_held_action. If he wants it changed ("keep Friday's"), make the tool call for the changed set; that replaces it and he gets new buttons. If his message is about something else, just answer it. Never say the held action is done.`)
+    ? `HELD ACTION WAITING (id ${openQuestion.id}). Jensen was sent: "${openQuestion.echo}" with Yes / No buttons. Nothing you do can confirm it: only his tap on Yes runs it. If his message means yes, tell him in one line to tap Yes on that message. If he does not want it ("don't send it", "cancel that"), call cancel_held_action. If he wants it changed ("keep Friday's"), make the tool call for the changed set; that replaces it and he gets new buttons. If his message is about something else, just answer it. Never say the held action is done.`
     : "";
 
   const tail = [
@@ -276,22 +274,8 @@ export async function confirmRouter(ctx: {
 }): Promise<{ reply: string | null; open: PendingAction | null; held?: { id: string; echo: string } }> {
   const kind = classifyReply(ctx.lastUser);
 
-  if (ctx.channel === "portal") {
-    // Portal: a synchronous screen with no scheduled pushes landing in it. Code keeps
-    // the held question as the last line of every portal reply while it is open, so
-    // his bare "yes" here answers exactly what is on his screen.
-    const open = await findOpenHold(ctx.party, "portal");
-    if (!open) return { reply: null, open: null };
-    const onScreen = await lastOutboundCarries(ctx.party, open.echo, "portal");
-    if (onScreen && kind === "no") { await cancelPending(open.id); return { reply: "Left it as it is.", open: null }; }
-    if (onScreen && kind === "yes") {
-      const claimed = await claimOnPortal(open.id, ctx.party, ctx.inboundId);
-      if (!claimed) return { reply: null, open };
-      const x = await executePending(claimed, { party: ctx.party, inboundId: ctx.inboundId });
-      return { reply: x.outcome, open: null };
-    }
-    return { reply: null, open };
-  }
+  // Portal: deletes and sends are refused there (no buttons), so nothing is held.
+  if (ctx.channel === "portal") return { reply: null, open: null };
 
   // WhatsApp: NOTHING executes from typed text. A held action runs only on a tap of
   // its own button, handled in the webhook before this. Typed replies are only
@@ -322,24 +306,6 @@ async function lastOutboundIsButtons(party: string): Promise<boolean> {
     return String(rows?.[0]?.content || "").trimEnd().endsWith("[Yes] [No, keep it]");
   } catch {
     return false;
-  }
-}
-
-// Compare what was sent with what was asked. The reply is dash-stripped before it
-// is stored (Law 5), so both sides are normalised the same way; otherwise a title
-// containing a dash would silently void the question.
-function sameText(t: string): string {
-  return stripDashes(String(t || "")).replace(/\s+/g, " ").trim().toLowerCase();
-}
-async function lastOutboundCarries(party: string, echo: string, channel: string): Promise<boolean> {
-  try {
-    const rows = await sbSelect<{ content: string }>(
-      "chat_messages",
-      `select=content&party=eq.${enc(party)}&role=eq.assistant&channel=eq.${enc(channel)}&order=ts.desc&limit=1`,
-    );
-    return sameText(rows?.[0]?.content || "").includes(sameText(echo));
-  } catch {
-    return false; // cannot prove he was answering this question -> it lapses
   }
 }
 
@@ -498,14 +464,9 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // JENSEN-DOCTRINE Law 5 enforcement — strip every em/en dash from the reply
   // BEFORE persisting + delivery. Same canonical form lands in chat_messages
   // and on the user's WhatsApp. Belt-and-braces with the chokepoint in sendWhatsApp.
-  // The question on screen is always the one that will run. WhatsApp: the webhook
-  // sends it as buttons after this reply. Portal: code keeps it as the LAST line of
-  // every reply while it is open (a new hold, or one still waiting), so a later bare
-  // "yes" there always answers exactly what he is looking at.
-  const showOnPortal = held?.echo ?? (chan === "portal" ? openQuestion?.echo : undefined);
-  const q = held?.echo ?? showOnPortal;
-  if (q) reply = reply.split(q).join("").trim(); // never asked twice
-  if (chan === "portal" && showOnPortal) reply = `${reply}\n\n${showOnPortal}\nReply yes to confirm.`.trim();
+  // WhatsApp shows the held question as Yes / No buttons right after this reply
+  // (webhook). Never asked twice: drop any copy of it the model wrote itself.
+  if (held) reply = reply.split(held.echo).join("").trim();
   reply = stripDashes(reply);
 
   // persist to the shared chat log + capture durable facts (non-blocking best-effort).

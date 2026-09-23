@@ -829,21 +829,15 @@ check("seam.85 the gate HOLDS with a question written by CODE from the real rows
   return null;
 });
 
-check("seam.86 the router settles only harmless cases; on WhatsApp NOTHING executes from typed text", () => {
+check("seam.86 NOTHING executes from typed text on any channel; the router only re-shows buttons or cancels", () => {
   const loop = read("lib/concierge/loop.ts");
-  const r = loop.slice(loop.indexOf("export async function confirmRouter"), loop.indexOf("// Compare what was sent with what was asked."));
-  const wa = r.slice(r.indexOf("// WhatsApp: NOTHING executes from typed text"));
-  if (/executePending\(|claimPending\(|claimByTap\(/.test(wa)) return "the WhatsApp branch of the router can execute a held action from typed text";
-  if (!/lastOutboundIsButtons\(ctx\.party\)/.test(wa)) return "typed yes/no is intercepted even when the buttons are not the last thing he saw";
-  const portal = r.slice(0, r.indexOf("// WhatsApp: NOTHING executes"));
-  if (!/findOpenHold\(ctx\.party, "portal"\)/.test(portal) || !/claimOnPortal\(open\.id, ctx\.party, ctx\.inboundId\)/.test(portal)) return "portal confirmations are not bound to the portal channel";
-  if (!/lastOutboundCarries\(ctx\.party, open\.echo, "portal"\)/.test(portal)) return "a portal 'yes' can confirm a question that is no longer on his screen";
+  const r = loop.slice(loop.indexOf("export async function confirmRouter"), loop.indexOf("async function lastOutboundIsButtons"));
+  if (/executePending\(|claimByTap\(|claimOnPortal\(/.test(r)) return "the router can execute a held action from typed text";
+  if (!/if \(ctx\.channel === "portal"\) return \{ reply: null, open: null \};/.test(r)) return "the portal can still act on a typed reply";
+  if (!/lastOutboundIsButtons\(ctx\.party\)/.test(r)) return "typed yes/no is intercepted even when the buttons are not the last thing he saw";
   const routerCall = loop.indexOf("await confirmRouter({");
   const buildCall = loop.indexOf("await buildSystem(lastUser");
   if (routerCall < 0 || (buildCall > 0 && routerCall > buildCall)) return "the router does not run before the prompt build";
-  const hook = read("app/api/whatsapp/route.ts");
-  if (!/inboundId: inboundWamid/.test(hook)) return "the webhook does not thread the inbound id";
-  if (!/inboundId: `portal:/.test(read("app/api/chat/route.ts"))) return "portal turns carry no inbound id";
   return null;
 });
 
@@ -905,18 +899,15 @@ check("seam.91 the monitor reads wall drops through a count-only endpoint with i
   return null;
 });
 
-check("seam.92 portal: a bare yes confirms only the question on screen; never the proposing message; one question per channel", () => {
-  const pa = read("lib/concierge/pending-actions.ts");
-  const c = pa.slice(pa.indexOf("export async function claimOnPortal"), pa.indexOf("export async function recentlyExecutedSame"));
-  if (!c) return "claimOnPortal missing";
-  if (!/a\.proposed_inbound_id === inboundId\) return null/.test(c)) return "the proposing message can confirm its own action (self-confirm)";
-  if (!/a\.channel !== "portal"/.test(c)) return "a WhatsApp hold could be confirmed by typing on the portal";
-  if (!/value->>status=eq\.pending/.test(pa)) return "the claim is not status-guarded";
-  const propose = pa.slice(pa.indexOf("export async function proposePending"), pa.indexOf("export async function findOpenHold"));
-  if (!/openFor\(input\.party, input\.channel\)/.test(propose)) return "proposing does not scope 'one question in flight' to the channel";
-  if (!/status: "cancelled" \}\)/.test(propose)) return "proposing does not cancel older open questions";
-  const loop = read("lib/concierge/loop.ts");
-  if (!/chan === "portal" && showOnPortal/.test(loop)) return "the portal question is not kept on screen while it waits, so a later 'yes' could not safely answer it";
+check("seam.92 the portal refuses deletes and sends (no buttons there; typed yes is unsafe, review 5 blocker)", () => {
+  const d = read("lib/concierge/dispatch.ts");
+  const g = d.slice(d.indexOf("async function destructiveGate("), d.indexOf("type Proposal ="));
+  const portal = g.indexOf('if (ctx?.channel === "portal")');
+  const propose = g.indexOf("await proposePending(");
+  if (portal < 0) return "a destructive action can be held on the portal";
+  if (propose > 0 && portal > propose) return "the portal check runs after the hold is created";
+  if (!/ask me on WhatsApp/.test(g)) return "the portal refusal does not tell him where he can do it";
+  if (/claimOnPortal/.test(read("lib/concierge/pending-actions.ts"))) return "a portal claim path still exists";
   return null;
 });
 
@@ -1001,10 +992,10 @@ check("seam.98 on WhatsApp a held action runs ONLY on a tap of its own button (r
   return null;
 });
 
-check("seam.99 code, not the model, shows the held question: Yes/No buttons on WhatsApp, the last line on the portal", () => {
+check("seam.99 code, not the model, shows the held question, as Yes / No buttons on WhatsApp", () => {
   const loop = read("lib/concierge/loop.ts");
   if (!/if \(r\.held\) held = r\.held;/.test(loop)) return "the held question is not captured from the tool result";
-  if (!/if \(q\) reply = reply\.split\(q\)\.join\(""\)\.trim\(\);/.test(loop)) return "a model-written copy of the question is not removed (he would be asked twice)";
+  if (!/if \(held\) reply = reply\.split\(held\.echo\)\.join\(""\)\.trim\(\);/.test(loop)) return "a model-written copy of the question is not removed (he would be asked twice)";
   if (!/return \{ held: held \?\? undefined, reply/.test(loop)) return "the held action is not returned to the webhook";
   const hook = read("app/api/whatsapp/route.ts");
   if ((hook.match(/if \(held\) await sendConfirmButtons\(/g) || []).length < 2) return "a reply path (text or voice) does not send the buttons";
@@ -1085,7 +1076,8 @@ check("seam.105 'done' never falls back to 'the most recently created' (21 Sep);
   const loop = read("lib/concierge/loop.ts");
   const line = loop.slice(loop.indexOf("`DONE-RESOLUTION:"), loop.indexOf("`,", loop.indexOf("`DONE-RESOLUTION:")));
   if (/Pick the most recently mentioned by name or the most recently created/.test(line)) return "the prompt still tells the model to pick the most recently created task";
-  if (!/LAST REMINDER I SENT HIM/.test(line)) return "the prompt does not anchor 'done' to the last reminder sent";
+  if (!/LAST THING I SENT HIM/.test(line)) return "the prompt does not anchor 'done' to the last message he was sent";
+  if (!/If my last message was about something else/.test(line)) return "'done' after an unrelated message still resolves to an older reminder (review 5, #3)";
   const hook = read("app/api/whatsapp/route.ts");
   const h = hook.slice(hook.indexOf("async function pingedJustNow"), hook.indexOf("async function sendConfirmButtons"));
   if (!/if \(\(ev as any\)\.recurrence\) return \{ id: ev\.id, title: ev\.title \};/.test(h)) return "a weekly reminder's next occurrence blocks 'done', sending it to the model";
@@ -1097,6 +1089,32 @@ check("seam.106 set_reminder never accepts a reminder that cannot ping; a passed
   const c = d.slice(d.indexOf('case "set_reminder"'), d.indexOf('case "create_event"'));
   if (!/minsNow \+ 6/.test(c)) return "a reminder under the cron's 5-minute lead is accepted and never pings";
   if (!/if \(ev\.recurrence === "weekly"\) d\.setUTCDate\(d\.getUTCDate\(\) \+ 7\)/.test(c)) return "'every Monday' said on a Monday after 09:00 is refused instead of starting next week";
+  return null;
+});
+
+check("seam.107 a tap acts only on what its message showed: the rows are re-read and the question rebuilt before anything runs (review 5, #2)", () => {
+  const d = read("lib/concierge/dispatch.ts");
+  const e = d.slice(d.indexOf("export async function executePending"), d.indexOf("export function describeOutcome"));
+  const check = e.indexOf("now.echo !== claimed.echo");
+  const run = e.indexOf("await runAction(claimed.tool");
+  if (check < 0) return "a tap can act on rows that changed after the question was shown";
+  if (run > 0 && check > run) return "the re-check happens after the action already ran";
+  if (!/That has changed since I asked, so I didn't do it/.test(e)) return "a changed action does not tell him plainly that nothing happened";
+  return null;
+});
+
+check("seam.108 no untrue claim words: 'cancelled' never stands for something that ran; a send in progress is not 'sent'", () => {
+  const d = read("lib/concierge/dispatch.ts");
+  const c = d.slice(d.indexOf('case "cancel_held_action"'), d.indexOf('case "set_reminder"'));
+  if (!/Nothing was waiting to cancel/.test(c) || !/ok: false/.test(c)) return "cancel_held_action reports success when nothing was waiting (it could back 'cancelled' for a send that went)";
+  const g = d.slice(d.indexOf("async function destructiveGate("), d.indexOf("type Proposal ="));
+  if (!/STILL SENDING/.test(g) || !/UNKNOWN: I could not confirm whether/.test(g)) return "an in-progress or crashed send is reported as already sent";
+  const hook = read("app/api/whatsapp/route.ts");
+  if (!/I couldn't confirm whether that went through/.test(hook)) return "a stale 'confirmed' tells him 'still working' forever";
+  const loop = read("lib/concierge/loop.ts");
+  const line = loop.slice(loop.indexOf("`DESTRUCTIVE ACTIONS"), loop.indexOf("`,", loop.indexOf("`DESTRUCTIVE ACTIONS")));
+  if (/word for word/.test(line) || /next message confirms/.test(line)) return "the prompt still tells the model the confirmation is a typed reply (contradicts the buttons)";
+  if (!/never tell him to type "yes"/.test(line)) return "the model may tell him to type yes instead of tapping";
   return null;
 });
 

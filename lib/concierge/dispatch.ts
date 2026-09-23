@@ -289,6 +289,15 @@ async function destructiveGate(
   if (!DESTRUCTIVE.has(name)) return null;
   if (ctx?.confirmedPendingId) return null; // set only by executePending, never reachable from model input
 
+  // The portal has no confirmation buttons, and five review rounds showed that a
+  // TYPED "yes" cannot be safely tied to the action it answers (on the portal an
+  // old pending delete ran on a "yes" meant for a newer question). So deletes and
+  // sends are WhatsApp-only, where he confirms with a tap on the action itself.
+  // Jensen sent 0 portal messages in the 60 days to 2026-09-23.
+  if (ctx?.channel === "portal") {
+    return { ok: false, error: `NOT DONE: on the portal I cannot confirm deletes or sends. Tell Jensen to ask me on WhatsApp, where he confirms with one tap. Nothing happened.` };
+  }
+
   const d = await describeProposal(name, input, ctx);
   if (d.nothing) return { ok: false, error: `NOTHING TO DO: ${d.nothing}` };
 
@@ -297,7 +306,16 @@ async function destructiveGate(
   if (OUTWARD_SENDS.has(name)) {
     const { recentlyExecutedSame } = await import("./pending-actions");
     const done = await recentlyExecutedSame(ctx?.party || "jensen", name, d.args);
-    if (done) return { ok: false, error: `ALREADY SENT a few minutes ago. Do not send it again; tell Jensen it already went out.` };
+    if (done?.status === "executed") return { ok: false, error: `ALREADY SENT a few minutes ago. Do not send it again; tell Jensen it already went out.` };
+    if (done?.status === "confirmed") {
+      const ageMs = Date.now() - new Date(done.confirmed_at || done.created_at).getTime();
+      return {
+        ok: false,
+        error: ageMs < 2 * 60_000
+          ? `STILL SENDING: that exact send is going out right now. Tell Jensen it is being sent; do not send it again.`
+          : `UNKNOWN: I could not confirm whether that exact send went out. Tell Jensen to check before asking me to send it again. Do not send it again now.`,
+      };
+    }
   }
 
   const pending = await proposePending({
@@ -307,7 +325,7 @@ async function destructiveGate(
     echo: d.echo,
     proposedText: ctx?.lastUser || "",
     proposedInboundId: ctx?.inboundId ?? null,
-    channel: ctx?.channel === "portal" ? "portal" : "whatsapp",
+    channel: "whatsapp",
   });
   if (!pending) {
     return {
@@ -439,6 +457,15 @@ export async function executePending(
   claimed: { id: string; tool: string; args: any; proposed_text: string; echo: string },
   ctx: { party: string; inboundId?: string | null },
 ): Promise<{ ok: boolean; executedTool: string; outcome: string; result?: any }> {
+  // Re-read the rows NOW and rebuild the question. If it no longer matches what he
+  // was shown (he moved the meeting, a row was deleted, a name changed), the tap
+  // would act on something he did not see, so it does nothing (review 5, #2).
+  const now = await describeProposal(claimed.tool, claimed.args, { party: ctx.party, lastUser: claimed.proposed_text }).catch(() => null);
+  if (!now || now.nothing || now.echo !== claimed.echo) {
+    const { markExecuted } = await import("./pending-actions");
+    await markExecuted(claimed.id, { ok: false, error: "changed since shown" });
+    return { ok: false, executedTool: claimed.tool, outcome: "That has changed since I asked, so I didn't do it. Ask me again." };
+  }
   const r = await runAction(claimed.tool, claimed.args, {
     party: ctx.party,
     lastUser: claimed.proposed_text,
@@ -705,7 +732,19 @@ export async function runAction(
       case "cancel_held_action": {
         const { findOpenHold, cancelPending } = await import("./pending-actions");
         const open = await findOpenHold(ctx?.party || "jensen", ctx?.channel === "portal" ? "portal" : "whatsapp");
-        if (!open) { result = { cancelled: false, note: "There was nothing waiting." }; break; }
+        if (!open) {
+          // Nothing was waiting. If something just RAN, say so: never let "cancelled,
+          // it won't go out" stand for a send that already went (review 5, #5).
+          const { lastExecuted } = await import("./pending-actions");
+          const last = await lastExecuted(ctx?.party || "jensen");
+          result = {
+            ok: false,
+            error: last
+              ? `Nothing was waiting to cancel. The last one already ran: ${last.echo.split("\n")[0].slice(0, 120)} Tell Jensen plainly it was already done; do not say it was cancelled.`
+              : "Nothing was waiting to cancel. Tell Jensen there was nothing pending; do not say anything was cancelled.",
+          };
+          break;
+        }
         await cancelPending(open.id);
         result = { cancelled: true, what: open.echo.split("\n")[0].slice(0, 160) };
         break;

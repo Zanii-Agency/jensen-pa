@@ -15,9 +15,8 @@
 //    exact action, so an "ok" to a reminder, a stale message, a swipe, or text
 //    injected into the conversation can never fire it. (Three rounds of review
 //    showed that inferring what a typed "yes" answers is not safely solvable.)
-//  - Portal: a synchronous screen with no scheduled pushes landing in it. His bare
-//    "yes" confirms only while the question is the last thing on that screen
-//    (checked by the router), then claimOnPortal.
+//  - Portal: NOT at all. It has no buttons, and a typed "yes" cannot be safely tied
+//    to the action it answers, so deletes and sends are refused there (dispatch).
 //  - Either way: one question in flight per party and channel; the proposing
 //    message can never confirm it; the claim is an atomic, status-guarded PATCH
 //    (two racing confirmations, exactly one executes; proven live 2026-09-23).
@@ -45,6 +44,7 @@ export type PendingAction = {
   created_at: string;
   expires_at: string;
   executed_at?: string;
+  confirmed_at?: string;               // when a tap claimed it; a stale "confirmed" reads as unknown
 };
 
 const TTL_MS = 30 * 60_000;
@@ -159,7 +159,7 @@ export async function claimByTap(id: string, party: string, tapInboundId: string
     const row = rows?.[0];
     const a = row?.value;
     if (!row || !a || a.status !== "pending" || !isLive(a) || a.party !== party || a.channel !== "whatsapp") return null;
-    const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: tapInboundId };
+    const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: tapInboundId, confirmed_at: new Date().toISOString() };
     const won = await sbUpdateReturning<{ value: PendingAction }>(
       "kv",
       `key=eq.${enc(row.key)}&${STATUS_PENDING}`,
@@ -181,30 +181,6 @@ export async function holdStatus(id: string): Promise<PendingAction | null> {
   }
 }
 
-// Claim on the PORTAL: his own later bare "yes", accepted by the router only when
-// the question is the last thing on his screen. Same guarantees as a tap: still
-// pending, not expired, same party, a PORTAL hold, never the proposing message,
-// atomic.
-export async function claimOnPortal(id: string, party: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
-  if (!inboundId) return null;
-  try {
-    const rows = await sbSelect<{ key: string; value: PendingAction }>("kv", `select=key,value&${byId(id)}&limit=1`);
-    const row = rows?.[0];
-    const a = row?.value;
-    if (!row || !a || a.status !== "pending" || !isLive(a) || a.party !== party || a.channel !== "portal") return null;
-    if (a.proposed_inbound_id === inboundId) return null; // SELF-CONFIRM: the proposing message cannot confirm itself
-    const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: inboundId };
-    const won = await sbUpdateReturning<{ value: PendingAction }>(
-      "kv",
-      `key=eq.${enc(row.key)}&${STATUS_PENDING}`,
-      { value: claimed, updated_at: Date.now() },
-    );
-    return won.length === 1 ? won[0].value : null;
-  } catch {
-    return null;
-  }
-}
-
 // The same action (same tool, same args) executed in the last few minutes. Used to
 // refuse re-holding an outward send that already went out, so a double-tap can
 // never send the same email twice.
@@ -218,6 +194,20 @@ export async function recentlyExecutedSame(party: string, tool: string, args: an
     // (review 4, finding 2).
     const running = await sbSelect<{ value: PendingAction }>("kv", `${base}&value->>status=eq.confirmed`);
     return running?.[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// The most recent action that actually ran for this party (for honest wording when
+// he tries to cancel something that already happened).
+export async function lastExecuted(party: string, withinMs = 30 * 60_000): Promise<PendingAction | null> {
+  try {
+    const rows = await sbSelect<{ value: PendingAction }>(
+      "kv",
+      `select=value&${partyLike(party)}&value->>status=eq.executed&value->>error=is.null&updated_at=gte.${Date.now() - withinMs}&order=updated_at.desc&limit=1`,
+    );
+    return rows?.[0]?.value ?? null;
   } catch {
     return null;
   }

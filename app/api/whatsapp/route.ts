@@ -137,13 +137,13 @@ async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
   // new row the moment it fires. That row is next week's reminder, not "the rest of
   // a series still firing", so "done" closes this occurrence only (review 4, #3).
   if ((ev as any).recurrence) return { id: ev.id, title: ev.title };
-  // A one-off burst of pings for the same thing on the same day (the DJ chase:
-  // "Send payment for DJ", "(reminder 2)", "(reminder 4)") IS a series: "done"
-  // could mean this one or all of them, so the brain asks.
+  // One-off pings for the same thing still to come (the DJ chase: "Send payment
+  // for DJ", "(reminder 2)", "(reminder 4)"; or "remind me Mon, Tue, Wed") ARE a
+  // series: "done" could mean this one or all of them, so the brain asks.
   const base = ev.title.replace(/\s*\(reminder \d+\)\s*$/i, "").trim();
   const more = await sbSelect<{ id: string }>(
     "events",
-    `select=id&title=ilike.${enc(base + "*")}&reminded_at=is.null&outcome=is.null&date=eq.${enc((ev as any).date)}&id=neq.${enc(ev.id)}&limit=1`,
+    `select=id&title=ilike.${enc(base + "*")}&reminded_at=is.null&outcome=is.null&date=gte.${enc((ev as any).date)}&id=neq.${enc(ev.id)}&limit=1`,
   );
   if (more.length) return null;
   return { id: ev.id, title: ev.title };
@@ -327,7 +327,8 @@ export async function POST(req: NextRequest) {
       // What a tap on a button that can no longer run says, read from the record.
       const why = (h: Awaited<ReturnType<typeof holdStatus>>): string =>
         !h || h.party !== tapParty ? "I can't find that request any more. Ask me again."
-        : h.status === "confirmed" ? "Still working on that one."
+        : h.status === "confirmed" && Date.now() - new Date(h.confirmed_at || h.created_at).getTime() < 2 * 60_000 ? "Still working on that one."
+        : h.status === "confirmed" ? "I couldn't confirm whether that went through. Check before asking me again."
         : h.status === "executed" && h.error ? "That did not go through last time. Ask me again and I'll retry."
         : h.status === "executed" ? "That was already done."
         : h.status === "cancelled" ? "That one was cancelled. Ask me again if you still want it."
