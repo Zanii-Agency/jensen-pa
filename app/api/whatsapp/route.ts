@@ -112,6 +112,20 @@ async function recentHistory(party: string): Promise<{ role: "user" | "assistant
   }
 }
 
+// The event Jensen was most recently pinged about, if that ping is recent and
+// unambiguous. Null when there is none in the last 3 hours, or when the two most
+// recent pings are within 20 minutes of each other (then "done" could mean either).
+async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
+  const since = Date.now() - 3 * 3_600_000;
+  const rows = await sbSelect<{ id: string; title: string; reminded_at: number }>(
+    "events",
+    `select=id,title,reminded_at&reminded_at=gte.${since}&outcome=is.null&order=reminded_at.desc&limit=2`,
+  );
+  if (!rows.length) return null;
+  if (rows.length > 1 && Number(rows[0].reminded_at) - Number(rows[1].reminded_at) < 20 * 60_000) return null;
+  return { id: rows[0].id, title: rows[0].title };
+}
+
 export async function POST(req: NextRequest) {
   try {
     const raw = await req.text();
@@ -537,28 +551,35 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // FM-11 DETERMINISTIC DONE-RESOLUTION. Bare confirmations from JENSEN
-    // (owner tier only) route the most recently created open task to done
-    // WITHOUT model dispatch. KT #127: when the model is brittle for a
-    // deterministic verb, code the verb. Owner-only because Taona (admin)
-    // chatting "Done" must NOT mark Jensen's tasks complete. Strip the
-    // harness tag before matching so the prod harness exercises this path.
-    // Wall 1 carve-out (2026-06-16): a swipe-anchor on the same turn means
-    // Jensen pointed at a specific message, so the LLM brain steers better
-    // than open[0]; fall through to runConcierge in that case.
+    // FM-11 DETERMINISTIC DONE-RESOLUTION, v2 (2026-09-23).
+    //
+    // A bare "done" answers the thing I JUST pinged him about. v1 marked "the most
+    // recently CREATED open task" complete, which is an unrelated row: on 21 Sep he
+    // got "Reminder. Meeting with Marisa Peers at 16:30", replied "done", and v1
+    // closed "Message Stéphane" (created that morning) -- the one reminder he had
+    // said he still wanted. It then could never fire.
+    //
+    // v2 anchors to the calendar event whose reminder fired most recently (the
+    // reminder cron stamps reminded_at). If there is no recent ping, or two pings
+    // are too close to tell apart, it does NOT guess: it falls through to the
+    // brain, which can see the thread and ask. A matcher that cannot find the
+    // intended row must say so, never fall through to a weaker match.
+    //
+    // Owner-only: Taona (admin) chatting "Done" must NOT close Jensen's items. A
+    // swipe-anchor means he pointed at a specific message, so the brain resolves it.
     const cleaned = text.replace(/^\s*\[H[a-z0-9]{6,}\]\s*/, "").trim();
     const doneEligible = sender.role === "owner" || process.env.JENSEN_MODE === "TRAINING";
     if (doneEligible && !swipeAnchor && /^(done|done\.|did it|yes done|handled|marked done)$/i.test(cleaned)) {
-      const open = await ops.listTasks({ done: false }).catch(() => [] as any[]);
-      if (open.length > 0) {
-        await ops.updateTask({ id: open[0].id, done: true }).catch(() => {});
+      const target = await pingedJustNow().catch(() => null);
+      if (target) {
+        await ops.completeEvent({ id: target.id }).catch(() => {});
         await ops.chatAppend("user", text, "whatsapp", "jensen", { externalId: inboundWamid }).catch(() => {});
-        const reply = `Done. Marked "${open[0].title}" complete.`;
+        const reply = `Done. Marked "${target.title}" complete.`;
         await ops.chatAppend("assistant", reply, "whatsapp", "jensen").catch(() => {});
         await sendWhatsApp(from, reply);
         return NextResponse.json({ ok: true });
       }
-      // No open tasks: fall through to the brain so Jensen gets a graceful reply.
+      // No single recent ping to anchor to: the brain resolves it from the thread.
     }
 
     // DETERMINISTIC FILE-SEND-BACK (KT #206561, same principle as FM-11 above:

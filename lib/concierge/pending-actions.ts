@@ -90,12 +90,28 @@ export async function proposePending(input: {
   try {
     sweep(input.party).catch(() => {});
     const open = await openFor(input.party);
-    let same: PendingAction | null = null;
+    let same: { key: string; value: PendingAction } | null = null;
     for (const r of open) {
-      if (r.value.args_hash === hash && isLive(r.value)) { same = r.value; continue; }
+      if (r.value.args_hash === hash && isLive(r.value)) { same = r; continue; }
       await setValue(r.key, { ...r.value, status: "cancelled" });
     }
-    if (same) return same;
+    if (same) {
+      // The identical action was asked again (he asked "are those all of them?" and
+      // the model re-held the same rows). Re-arm it for the NEXT reply. Left bound to
+      // the previous inbound, his next "yes" would have cancelled it instead
+      // (review 2, finding 2: the 16-Sep ask-again loop).
+      const nowMs = Date.now();
+      const rearmed: PendingAction = {
+        ...same.value,
+        echo: input.echo,
+        proposed_text: input.proposedText || same.value.proposed_text,
+        proposed_inbound_id: input.proposedInboundId ?? null,
+        offered_to: null,
+        expires_at: new Date(nowMs + TTL_MS).toISOString(),
+      };
+      await setValue(same.key, rearmed);
+      return rearmed;
+    }
 
     const nowMs = Date.now();
     const action: PendingAction = {
@@ -169,6 +185,58 @@ export async function claimPending(id: string, inboundId: string | null | undefi
       { value: claimed, updated_at: Date.now() },
     );
     return won.length === 1 ? won[0].value : null;
+  } catch {
+    return null;
+  }
+}
+
+// Did THIS inbound already confirm something? (A WhatsApp retry or a concurrent
+// invocation that lost the claim.) Lets the router answer "Already done" instead
+// of falling through to a model that might re-hold the same send.
+export async function handledBy(party: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
+  if (!inboundId) return null;
+  try {
+    const rows = await sbSelect<{ value: PendingAction }>(
+      "kv",
+      `select=value&${partyLike(party)}&value->>confirm_inbound_id=eq.${enc(inboundId)}&limit=1`,
+    );
+    return rows?.[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// The same action (same tool, same args) executed in the last few minutes. Used to
+// refuse re-holding an outward send that already went out, so a double-tap can
+// never send the same email twice.
+export async function recentlyExecutedSame(party: string, tool: string, args: any, withinMs = 10 * 60_000): Promise<PendingAction | null> {
+  try {
+    const rows = await sbSelect<{ value: PendingAction }>(
+      "kv",
+      `select=value&${partyLike(party)}&value->>status=eq.executed&value->>args_hash=eq.${enc(argsHash(tool, args))}&updated_at=gte.${Date.now() - withinMs}&limit=1`,
+    );
+    return rows?.[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Re-arm a held action for the NEXT reply. Used when he answered a SEND with a yes
+// in other words: sends only go out on his own plain "yes", so the system re-asks,
+// and that next reply must still be able to answer it.
+export async function rearmPending(id: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
+  try {
+    const rows = await sbSelect<{ key: string; value: PendingAction }>("kv", `select=key,value&${byId(id)}&limit=1`);
+    const row = rows?.[0];
+    if (!row?.value || row.value.status !== "pending") return null;
+    const next: PendingAction = {
+      ...row.value,
+      proposed_inbound_id: inboundId ?? null,
+      offered_to: null,
+      expires_at: new Date(Date.now() + TTL_MS).toISOString(),
+    };
+    await setValue(row.key, next);
+    return next;
   } catch {
     return null;
   }

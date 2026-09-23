@@ -53,6 +53,16 @@ export async function sendTextAndLog(
     ts: Date.now(),
   }).select("id").single();
   const insertedRowId: number | null = (ins?.data as any)?.id ?? null;
+  // A killed scheduled message (brief, reminder, mail alert) must reach SOMEONE.
+  // Before 2026-09-23 this path logged an audit row and nothing else, so six
+  // morning briefs died silently. Page the developer with the original, the same
+  // as the reply path in whatsapp.ts. Skipped for dev sends (they ARE the developer).
+  if (sanitized.dropped) {
+    const dev = devPhone();
+    if (dev) {
+      sendWhatsAppRaw(dev, `[Dorje wall] blocked a scheduled message to the client (caught: ${sanitized.caught.map((c) => `${c.kind}:${c.pattern}`).join(",")}). Original: ${String(body).slice(0, 500)}`, { force: true }).catch(() => {});
+    }
+  }
   if (sanitized.caught.length) {
     try {
       await admin().from("chat_messages").insert({

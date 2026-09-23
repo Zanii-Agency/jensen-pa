@@ -25,6 +25,9 @@ const CROSS_CUTTING = [
   // "stop them" routes to whatever lane its words suggest, and if the tool is not
   // there the model cannot confirm and the held action silently lapses.
   "confirm_pending_action",
+  // set_reminder: "remind me" can arrive in any lane's words, and without it the
+  // model falls back to create_task, which never pings him.
+  "set_reminder",
   "find_contact", "query_memory", "query_calendar", "get_settings",
   "remember_preference", "add_note",
   // NOTE (KT #206597): remember_fact + entity_dashboard were considered for

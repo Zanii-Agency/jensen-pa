@@ -70,8 +70,10 @@ test("in a burst, the owner's FINAL line governs", () => {
 // ---- the words he reads after a confirmation come from what actually happened ----
 
 test("a failed action never reads as done", () => {
-  assert.match(describeOutcome("send_email", { ok: false, error: "SMTP 550 mailbox unavailable" }), /did not go through/);
-  assert.match(describeOutcome("delete_event", { ok: false, error: "timeout" }), /nothing changed/);
+  // A failed SEND must not promise "nothing changed": a timeout can land after the
+  // mail already left. And no raw error text ever reaches him.
+  assert.equal(describeOutcome("send_email", { ok: false, error: "SMTP 550 mailbox unavailable" }), "I could not confirm that went out. Check before I try again.");
+  assert.equal(describeOutcome("delete_event", { ok: false, error: "events delete 401: JWT expired" }), "That did not go through, so nothing changed.");
 });
 
 test("the delete count is the number actually deleted, not the number asked for", () => {

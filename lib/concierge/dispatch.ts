@@ -38,7 +38,7 @@ const ZANII_READS = new Set([
 const TENANT_WRITES = new Set<string>([
   "create_entity", "update_entity", "delete_entity",
   "create_task", "send_task_to_peer", "update_task", "complete_task", "delete_task", "accept_meeting_tasks",
-  "create_event", "update_event", "delete_event", "complete_event",
+  "create_event", "set_reminder", "update_event", "delete_event", "complete_event",
   "record_finance", "update_finance", "delete_finance",
   "file_document", "delete_document",
   "set_legal_blueprint",
@@ -84,7 +84,7 @@ type Result = any;
 // CTH has no surface for this yet). Same regex, two adapter callbacks,
 // brain-core owns the truth.
 import { discriminatorMismatch as _bcDiscriminatorMismatch } from "@/lib/brain-core/index.js";
-function jensenDiscriminatorAdapters(ctx: { party?: string }) {
+function jensenDiscriminatorAdapters(ctx: { party?: string; lastUser?: string }) {
   return {
     getActiveTeamFirstNames: async (): Promise<string[]> => {
       const contacts: any[] = await sbSelect("contacts", "select=name").catch(() => []);
@@ -93,6 +93,10 @@ function jensenDiscriminatorAdapters(ctx: { party?: string }) {
         .filter((s: string) => !!s);
     },
     getLastUserInbound: async (): Promise<string | null> => {
+      // The message that asked for the action. On a confirmed execution this is the
+      // held proposal's text, NOT the bare "yes" (which names nobody and so let
+      // the wrong-person check pass; review 2, finding 3).
+      if (ctx.lastUser && ctx.lastUser.trim()) return ctx.lastUser;
       const party = ctx.party || "jensen";
       const rows: any[] = await sbSelect(
         "chat_messages",
@@ -103,7 +107,7 @@ function jensenDiscriminatorAdapters(ctx: { party?: string }) {
   };
 }
 async function discriminatorMismatch(
-  ctx: { party?: string },
+  ctx: { party?: string; lastUser?: string },
   candidateTitle: string
 ) {
   return _bcDiscriminatorMismatch(candidateTitle, jensenDiscriminatorAdapters(ctx));
@@ -281,12 +285,20 @@ async function destructiveGate(
   name: string,
   input: any,
   ctx?: { party?: string; lastUser?: string; inboundId?: string | null; confirmedPendingId?: string | null },
-): Promise<{ ok: boolean; error?: string } | null> {
+): Promise<{ ok: boolean; error?: string; held?: { id: string; echo: string } } | null> {
   if (!DESTRUCTIVE.has(name)) return null;
   if (ctx?.confirmedPendingId) return null; // set only by executePending, never reachable from model input
 
-  const d = await describeProposal(name, input);
+  const d = await describeProposal(name, input, ctx);
   if (d.nothing) return { ok: false, error: `NOTHING TO DO: ${d.nothing}` };
+
+  // A send that already went out in the last few minutes is never re-held: a
+  // double-tap "yes" must not send the same email twice (review 2, finding 7).
+  if (OUTWARD_SENDS.has(name)) {
+    const { recentlyExecutedSame } = await import("./pending-actions");
+    const done = await recentlyExecutedSame(ctx?.party || "jensen", name, d.args);
+    if (done) return { ok: false, error: `ALREADY SENT a few minutes ago. Do not send it again; tell Jensen it already went out.` };
+  }
 
   const pending = await proposePending({
     party: ctx?.party || "jensen",
@@ -306,11 +318,11 @@ async function destructiveGate(
   }
   return {
     ok: false,
+    held: { id: pending.id, echo: pending.echo },
     error:
-      `HELD, NOTHING HAS HAPPENED YET. Relay exactly this question to Jensen, word for word, ` +
-      `and nothing else about this action: "${pending.echo}" ` +
-      `Do not say it is done, cleared, removed, cancelled or sent. When his next message answers ` +
-      `it, call confirm_pending_action FIRST with id "${pending.id}".`,
+      `HELD, NOTHING HAS HAPPENED YET. The system will put this exact question at the end of your ` +
+      `reply, so do not repeat or rephrase it: "${pending.echo}" Do not say it is done, cleared, ` +
+      `removed, cancelled or sent.`,
   };
 }
 
@@ -325,6 +337,10 @@ function whenOf(date?: string, time?: string): string {
   const day = isNaN(d.getTime()) ? date : d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
   return time ? `${day} ${String(time).slice(0, 5)}` : day;
 }
+function fullBody(b: unknown): string {
+  const t = String(b ?? "").trim();
+  return t.length <= 3000 ? t : `${t.slice(0, 3000)}\n(and ${t.length - 3000} more characters)`;
+}
 function idList(input: any): string[] {
   const raw = Array.isArray(input?.ids) && input.ids.length
     ? input.ids
@@ -338,7 +354,7 @@ async function oneRow(table: string, id: unknown, cols: string): Promise<any | n
   const rows = await sbSelect<any>(table, `select=${cols}&id=eq.${enc(String(id))}&limit=1`);
   return rows?.[0] ?? null;
 }
-export async function describeProposal(name: string, input: any): Promise<Proposal> {
+export async function describeProposal(name: string, input: any, ctx?: { party?: string; lastUser?: string }): Promise<Proposal> {
   const gone = (what: string) => ({ echo: "", args: {}, nothing: `that ${what} no longer exists. Re-check before asking Jensen anything.` });
   switch (name) {
     case "delete_event": {
@@ -346,15 +362,23 @@ export async function describeProposal(name: string, input: any): Promise<Propos
       if (!ids.length) return gone("event");
       const rows = await sbSelect<any>("events", `select=id,title,date,time&id=in.(${ids.map(enc).join(",")})`);
       if (!rows.length) return gone("event");
+      // Every row he is about to lose is listed; none is hidden behind "and N more"
+      // (review 2, finding 8). Same titles are grouped so a reminder series stays short.
+      if (rows.length > 25) return { echo: "", args: {}, nothing: `that is ${rows.length} events, too many to confirm safely in one go. Ask Jensen to narrow it by date or name.` };
       rows.sort((a: any, b: any) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`));
       const args = { ids: rows.map((r: any) => r.id) };
       if (rows.length === 1) return { args, echo: `That removes ${q(rows[0].title)} (${whenOf(rows[0].date, rows[0].time)}) from your calendar. Confirm?` };
-      const shown = rows.slice(0, 6).map((r: any) => `${r.title} (${whenOf(r.date, r.time)})`).join("; ");
-      const more = rows.length > 6 ? `; and ${rows.length - 6} more` : "";
-      return { args, echo: `That removes ${rows.length} from your calendar: ${shown}${more}. Confirm?` };
+      const groups = new Map<string, any[]>();
+      for (const r of rows) groups.set(r.title, [...(groups.get(r.title) || []), r]);
+      const lines = [...groups.entries()].map(([title, rs]) => `${title}: ${rs.map((r) => whenOf(r.date, r.time)).join(", ")}`);
+      return { args, echo: `That removes ${rows.length} from your calendar:\n${lines.join("\n")}\nConfirm?` };
     }
     case "delete_task": {
       const r = await oneRow("tasks", input?.id, "id,title"); if (!r) return gone("task");
+      // The wrong-person wall runs when the action is PROPOSED, against the message
+      // that asked for it, not only at execution (review 2, finding 3).
+      const disc = await discriminatorMismatch({ party: ctx?.party, lastUser: ctx?.lastUser }, String(r.title || ""));
+      if (!disc.ok) return { echo: "", args: {}, nothing: `the task ${q(r.title)} is about ${disc.expected}, but Jensen named ${disc.got}. Ask him which one he meant.` };
       return { args: { id: r.id }, echo: `That deletes the task ${q(r.title)}. Confirm?` };
     }
     case "delete_entity": {
@@ -382,11 +406,13 @@ export async function describeProposal(name: string, input: any): Promise<Propos
       return { args: { id: r.id }, echo: `That forgets: ${q(r.fact)}. Confirm?` };
     }
     case "send_email":
-      return { args: input, echo: `That sends an email to ${input?.to} with the subject ${q(input?.subject)}. Confirm?` };
+      // The body he confirms IS the body that sends (review 2, finding 5).
+      return { args: input, echo: `That sends this email to ${input?.to}, subject ${q(input?.subject)}:\n\n${fullBody(input?.body)}\n\nSend it?` };
     case "reply_email": {
-      let to = "the sender";
-      try { const f: any = await readUnified(input?.id); to = f?.fromEmail || to; } catch { return gone("email"); }
-      return { args: input, echo: `That sends your reply to ${to}, starting ${q(String(input?.body || "").split("\n")[0])}. Confirm?` };
+      let to = "";
+      try { const f: any = await readUnified(input?.id); to = f?.fromEmail || ""; }
+      catch { return { echo: "", args: {}, nothing: "I could not open that email just now. Tell Jensen and try again in a moment; do not say it is gone." }; }
+      return { args: input, echo: `That sends this reply to ${to || "the sender"}:\n\n${fullBody(input?.body)}\n\nSend it?` };
     }
     case "send_meeting_invite":
       return { args: input, echo: `That sends ${input?.attendeeName || input?.attendeeEmail} a calendar invite for ${q(input?.title)} on ${whenOf(input?.date, input?.time)} Dubai time. Confirm?` };
@@ -416,7 +442,7 @@ export async function executePending(
   const ok = r.ok && !r.result?.simulated;
   const { markExecuted } = await import("./pending-actions");
   await markExecuted(claimed.id, { ok: r.ok, result: r.result, error: r.error });
-  try {
+  if (ctx.party === "jensen") try {
     const { admin } = await import("@/lib/db");
     await admin().from("chat_messages").insert({
       role: "system",
@@ -432,7 +458,13 @@ export async function executePending(
 // What a human reads after a confirmation, derived from what ACTUALLY happened.
 // Never "Done" for a failure, never a count that was proposed rather than deleted.
 export function describeOutcome(tool: string, r: { ok: boolean; result?: any; error?: string }): string {
-  if (!r.ok) return `That did not go through, so nothing changed. ${String(r.error || "").split(".")[0].slice(0, 140)}`.trim();
+  if (!r.ok) {
+    // Never show him a raw error, and never promise "nothing changed" for a send:
+    // a timeout can happen after the mail already left (review 2, note 9).
+    return OUTWARD_SENDS.has(tool)
+      ? "I could not confirm that went out. Check before I try again."
+      : "That did not go through, so nothing changed.";
+  }
   if (r.result?.simulated) return "Test turn: nothing was actually changed.";
   if (tool === "delete_event") {
     const n = Array.isArray(r.result?.deleted) ? r.result.deleted.length : 0;
@@ -543,7 +575,7 @@ export async function runAction(
   name: string,
   rawInput: any,
   ctx?: { party?: string; lastUser?: string; inboundId?: string | null; priorRuns?: number; confirmedPendingId?: string | null },
-): Promise<{ ok: boolean; result?: Result; error?: string }> {
+): Promise<{ ok: boolean; result?: Result; error?: string; held?: { id: string; echo: string } }> {
   try {
     // Confirmation state travels ONLY in ctx, which code builds. Any confirm-ish
     // field on the model's own tool input is discarded here, so an instruction
@@ -606,7 +638,7 @@ export async function runAction(
         // when the operator's last inbound names a different team contact.
         const trow: any[] = await sbSelect("tasks", `id=eq.${enc(String(input.id))}&select=title&limit=1`).catch(() => []);
         const title = String((trow?.[0]?.title) || "");
-        const disc = await discriminatorMismatch({ party: ctx?.party }, title);
+        const disc = await discriminatorMismatch({ party: ctx?.party, lastUser: ctx?.lastUser }, title);
         if (!disc.ok) {
           await emitDiscriminatorRefusal("update_task", String(input.id), title, disc.expected, disc.got, ctx?.party);
           return { ok: false, error: `I cannot update "${title}" from your message about ${disc.got}. Those name different people. Tell me which task you meant.` };
@@ -618,7 +650,7 @@ export async function runAction(
         // Wall 2 mirror of update_task.
         const trow: any[] = await sbSelect("tasks", `id=eq.${enc(String(input.id))}&select=title&limit=1`).catch(() => []);
         const title = String((trow?.[0]?.title) || "");
-        const disc = await discriminatorMismatch({ party: ctx?.party }, title);
+        const disc = await discriminatorMismatch({ party: ctx?.party, lastUser: ctx?.lastUser }, title);
         if (!disc.ok) {
           await emitDiscriminatorRefusal("complete_task", String(input.id), title, disc.expected, disc.got, ctx?.party);
           return { ok: false, error: `I cannot close "${title}" from your message about ${disc.got}. Those name different people. Tell me which task you meant.` };
@@ -630,7 +662,7 @@ export async function runAction(
         // Wall 2 mirror, doubly important because delete is irreversible.
         const trow: any[] = await sbSelect("tasks", `id=eq.${enc(String(input.id))}&select=title&limit=1`).catch(() => []);
         const title = String((trow?.[0]?.title) || "");
-        const disc = await discriminatorMismatch({ party: ctx?.party }, title);
+        const disc = await discriminatorMismatch({ party: ctx?.party, lastUser: ctx?.lastUser }, title);
         if (!disc.ok) {
           await emitDiscriminatorRefusal("delete_task", String(input.id), title, disc.expected, disc.got, ctx?.party);
           return { ok: false, error: `I will not delete "${title}" from your message about ${disc.got}. Those name different people. Tell me which task you meant.` };
@@ -659,6 +691,14 @@ export async function runAction(
       // calendar
       case "query_calendar": result = await ops.queryCalendar(input); break;
       case "day_log": result = await ops.dayLog(input.date); break;
+      // A reminder IS a timed calendar event: that is what the reminder cron pings.
+      // Routed through create_event so it gets the same weekday backstop, dev wall
+      // and receipt. (16 Sep: "remind me in two weeks" became a task, which is never
+      // pushed, while the bot told him "Reminder set for 5 October".)
+      case "set_reminder": {
+        const ev = { title: String(input.what || input.title || "").trim(), date: input.date, time: input.time || "09:00", note: "Reminder" };
+        await reconcileEventDate(ctx, ev); result = await ops.createEvent(ev); break;
+      }
       case "create_event": { await reconcileEventDate(ctx, input); await attachMeetingLink(ctx, input); result = await ops.createEvent(input); break; }
       case "send_email": {
         try {
@@ -704,7 +744,7 @@ export async function runAction(
         // carries a different first name from the one Jensen just named.
         const erow: any[] = await sbSelect("events", `id=eq.${enc(String(input.id))}&select=title&limit=1`).catch(() => []);
         const title = String((erow?.[0]?.title) || "");
-        const disc = await discriminatorMismatch({ party: ctx?.party }, title);
+        const disc = await discriminatorMismatch({ party: ctx?.party, lastUser: ctx?.lastUser }, title);
         if (!disc.ok) {
           await emitDiscriminatorRefusal("complete_event", String(input.id), title, disc.expected, disc.got, ctx?.party);
           return { ok: false, error: `I cannot mark "${title}" as completed from your message about ${disc.got}. Those name different people. Tell me which meeting you meant.` };
@@ -893,7 +933,7 @@ function stripConfirmFlags(input: any): any {
 async function confirmPendingAction(
   input: any,
   ctx?: { party?: string; inboundId?: string | null; priorRuns?: number },
-): Promise<{ ok: boolean; result?: Result; error?: string }> {
+): Promise<{ ok: boolean; result?: Result; error?: string; held?: { id: string; echo: string } }> {
   const party = ctx?.party || "jensen";
   if ((ctx?.priorRuns ?? 0) > 0) {
     return { ok: false, error: "confirm_pending_action must be the FIRST tool call of the turn. Nothing was done. Ask Jensen to confirm again." };
@@ -903,9 +943,27 @@ async function confirmPendingAction(
   if (!open || open.id !== String(input?.id || "")) {
     return { ok: false, error: "There is no open question with that id for this message. Nothing was done; do not claim it was." };
   }
-  if (input?.confirm !== true && input?.answer !== "yes") {
+  const yes = input?.confirm === true || ["true", "yes"].includes(String(input?.confirm ?? "").toLowerCase());
+  if (!yes) {
     await cancelPending(open.id);
     return { ok: true, result: { cancelled: true, outcome: "Left it as it is." } };
+  }
+  // An outward send is confirmed ONLY by his own plain "yes" through the code
+  // path, never by the model's reading of a longer message. Recalled documents and
+  // memory are already in the prompt, so injected text could otherwise steer the
+  // model into confirming a send (review 2, finding 6).
+  if (OUTWARD_SENDS.has(open.tool)) {
+    const { rearmPending } = await import("./pending-actions");
+    const again = await rearmPending(open.id, ctx?.inboundId);
+    if (!again) return { ok: false, error: "That send could not be re-armed. Nothing was sent; ask him to ask again." };
+    return {
+      ok: false,
+      // Re-asked VERBATIM: the router only honours a reply to the exact stored
+      // question, so rewording it here would void it. "Send it?" already asks for
+      // the plain yes.
+      held: { id: again.id, echo: again.echo },
+      error: "NOT SENT YET. A send goes out only on his own plain yes; the system is asking him for one. Do not say it was sent.",
+    };
   }
   const claimed = await claimPending(open.id, ctx?.inboundId);
   if (!claimed) return { ok: false, error: "That confirmation could not be applied (already handled or expired). Nothing new was done." };

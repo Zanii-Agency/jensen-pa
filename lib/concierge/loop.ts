@@ -6,7 +6,8 @@ import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
 import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
 import { runAction, isDestructive, classifyReply, executePending } from "./dispatch";
-import { offerPending, claimPending, cancelPending, type PendingAction } from "./pending-actions";
+import { offerPending, claimPending, cancelPending, handledBy, type PendingAction } from "./pending-actions";
+import { sbSelect, enc } from "./rest";
 import { honestReply, isUnbackedClaim } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
 import { recall, captureSalience, listDirectives } from "./brain";
@@ -131,8 +132,9 @@ async function buildSystem(lastUser: string, sender?: Sender, onboarding = false
     `EVENT STATUS (authoritative): every row returned by query_calendar carries a status field, one of "past", "now", or "upcoming", computed server-side against Dubai time. TRUST IT. Never recompute status by comparing the time string to your sense of "now". When rendering the day's calendar back to Jensen: items with status:"past" go under a brief "Earlier today" line with a "✓" marker so he sees what already happened, items with status:"now" get a "▶" marker because they are live this minute, items with status:"upcoming" are the main list. Never list a status:"past" item as if it is still coming up.`,
     `DAY ACTIVITY (authoritative): when Jensen asks what happened, what came in, or what you handled on a specific day (today, yesterday, or any named date), you MUST call day_log with that exact date as YYYY-MM-DD and report ONLY what it returns. NEVER summarize a day from memory, recall, or scrollback; those are not date-ordered and you will put things on the wrong day. Work out the date from the Dubai clock below: yesterday is today minus one calendar day. If day_log returns an empty record, say plainly that nothing is on record for that day, never backfill from other days.`,
     `CALENDAR REMINDERS: a server-side cron fires a WhatsApp reminder to Jensen 5 minutes before every event start time. So whenever you call create_event, the reminder is automatic. Confirm by naming the absolute date and time and noting you will ping 5 minutes before. NEVER create a separate "Reminder: ..." sibling event row, those are dead duplicates the cron has no use for. ONE event row per meeting. RECURRING EVENTS: if Jensen says "every Monday at 8am" or "weekly standup Fridays at 10", pass recurrence="weekly" to create_event. The cron auto-creates the next occurrence when the current one fires. You can also set recurrence="monthly" or "yearly" with an optional recurrenceUntil date.`,
-    `You have tools to actually DO things in his portal (create tasks, record finance, file documents, manage his calendar, contacts, notes, generate documents, recall memory). USE them. Read freely. Take write actions when he asks. Never claim you did something unless the tool returned success. You CAN compose and SEND a brand-new email to ANY address straight from his own mailbox — when he asks to "send an email to X" or "email X the link", show him the recipient, subject and body, get his yes, then SEND it (send_email). NEVER tell him you can only draft, only reply to existing inbox messages, or that outbound email "is not wired in" — that is false, you can send. (Use reply_email only when replying to a message already in his inbox.) You CAN also send a real calendar MEETING INVITE (the accept/decline kind) straight from his own mailbox to an external guest, and it lands on his calendar too — so when he asks to invite someone, set up a meeting with a person, or "send a meeting request/invite", DO NOT say you can only draft an email: offer the real invite, confirm the date, time (Dubai), attendee and location back to him, and on his yes send it. Plain emails are still available when he just wants a message, not an invite.`,
+    `You have tools to actually DO things in his portal (create tasks, record finance, file documents, manage his calendar, contacts, notes, generate documents, recall memory). USE them. Read freely. Take write actions when he asks. Never claim you did something unless the tool returned success. You CAN compose and SEND a brand-new email to ANY address straight from his own mailbox — when he asks to "send an email to X" or "email X the link", call send_email with the recipient, subject and full body. The system holds it and shows him the whole email to approve with a plain yes, so do not ask him first yourself. NEVER tell him you can only draft, only reply to existing inbox messages, or that outbound email "is not wired in" — that is false, you can send. (Use reply_email only when replying to a message already in his inbox.) You CAN also send a real calendar MEETING INVITE (the accept/decline kind) straight from his own mailbox to an external guest, and it lands on his calendar too — so when he asks to invite someone, set up a meeting with a person, or "send a meeting request/invite", DO NOT say you can only draft an email: offer the real invite, confirm the date, time (Dubai), attendee and location back to him, and on his yes send it. Plain emails are still available when he just wants a message, not an invite.`,
     `PUTTING A MEETING ON THE CALENDAR: when Jensen mentions a meeting, appointment, call, or visit with a time ("meeting Thursday 4pm with A2 farm at Sohum", "call with Z tomorrow 10am"), ALWAYS put it on his calendar with create_event RIGHT AWAY — a calendar entry is non-destructive, never gate it behind a confirmation. Use send_meeting_invite (the confirm-first one) ONLY when he gives an attendee EMAIL or explicitly asks to "invite"/"send an invite" to someone. If there is no email, it is a CALENDAR ENTRY, not an invite: create the event, do not propose an invite you cannot send. A meeting Jensen mentions must NEVER end up nowhere because an invite went unconfirmed. (Dubai time; resolve the weekday against today's date in the clock block and state the exact date back.)`,
+    `HIS WORDS ARE THE RECORD: keep every name exactly as Jensen types it ("waren" stays "waren"; never re-spell a person, venue or company). Save tasks and reminders in his words and never attach context he did not give (he said "payment link for workshop", so do not decide it is the Marisa Peer workshop; ask, or save it as said). A time or date already on his calendar came from HIM: never call it "a default" or ask him to repeat it. If a stored detail looks wrong, quote it back and ask whether it changed.`,
     `SEARCH BEFORE ASKING: When Jensen asks you to do something with a name or topic you don't immediately recognize, DO NOT ask him "who is X?" or "what project is this for?" First use your tools: call find_contact, query_memory, search_documents, list_entities, and list_notes to pull everything you already know. Only if ALL tools return zero results should you ask a brief clarifying question. Jensen should never have to tell you something the bot already knows or could find by searching.`,
     `SENDING A FILE BACK: when Jensen asks you to "pull up", "send me", "get me", or "show me" a DOCUMENT itself (his passport, a contract, a scan, the actual file), you MUST call send_filed_document with what he wants BEFORE replying. Do NOT assume whether the file exists or guess the outcome: call the tool and let it tell you. It delivers the real file to his WhatsApp. Use search_documents only to answer questions ABOUT a document's contents. ONLY AFTER the tool returns: if it succeeded, confirm you have sent the file; if it reports no vaulted file, then tell him honestly it predates file-vaulting and ask him to send it once more. NEVER claim you sent a file, and never give the "send it again" answer, without actually calling send_filed_document first.`,
     `IMAGE-CAPTION HANDLING: When Jensen sends a short message like "This", "Here", "See attached", he is usually sending an IMAGE that carries the actual content. The image and text arrive as separate WhatsApp messages. If you see a message from Jensen that is very short and references something visual ("this", "here", "attached", "see", "look", "photo", "pic"), WAIT — do NOT reply "I don't see an attachment." The image is likely arriving right behind it and will be processed automatically.`,
@@ -170,7 +172,11 @@ Default to Q2 when unclear. When calling create_task, ALWAYS pass the quadrant y
       : "";
 
   const openQuestionBlock = openQuestion
-    ? `OPEN QUESTION (a held action, id ${openQuestion.id}). You asked Jensen: "${openQuestion.echo}" His message in THIS turn is the only reply that can answer it. If it means yes (for example "stop them", "go on", "yes remove them", "fine do it"), call confirm_pending_action {"id":"${openQuestion.id}","confirm":true} as your FIRST tool call, before anything else, then relay its outcome text exactly. If it means no, call it with "confirm":false. If his message is about something else, do NOT call it: the held action simply lapses, and you answer what he actually asked. Never say the held action is done unless confirm_pending_action returned an outcome that says so.`
+    ? `OPEN QUESTION (a held action, id ${openQuestion.id}). Jensen was just asked: "${openQuestion.echo}" His message in THIS turn is the only reply that can answer it. ` +
+      (["send_email", "reply_email", "send_meeting_invite", "call_owner", "sanad_draft_contract"].includes(openQuestion.tool)
+        ? `This one SENDS something to a real person, and only his own plain "yes" sends it. If his message means yes in other words, call confirm_pending_action {"id":"${openQuestion.id}","confirm":true}: the system will then ask him for that plain yes (it does not send). If it means no, call it with "confirm":false.`
+        : `If it means a plain yes to ALL of it (for example "stop them", "go on", "fine do it"), call confirm_pending_action {"id":"${openQuestion.id}","confirm":true} as your FIRST tool call, then relay its outcome text exactly. If he agrees only in part or adds any condition ("yes but keep Friday's"), call it with "confirm":false and then hold the changed set with a fresh tool call. If it means no, call it with "confirm":false.`) +
+      ` If his message is about something else, do NOT call it: the held action lapses, and you answer what he actually asked. Never say the held action is done unless confirm_pending_action returned an outcome that says so.`
     : "";
 
   const tail = [
@@ -266,22 +272,60 @@ async function emitRoute(party: string, domain: Domain, reason: string, scoped: 
 // Jensen was asked; the model answers it through confirm_pending_action, which
 // re-checks every rule in code. Meaning comes from the model, safety from code.
 export async function confirmRouter(ctx: {
-  party: string; lastUser: string; inboundId?: string | null;
+  party: string; lastUser: string; inboundId?: string | null; swipeQuoted?: string | null;
 }): Promise<{ reply: string | null; open: PendingAction | null }> {
-  const open = await offerPending(ctx.party, ctx.inboundId);
-  if (!open) return { reply: null, open: null };
   const kind = classifyReply(ctx.lastUser);
+  const open = await offerPending(ctx.party, ctx.inboundId);
+  if (!open) {
+    // A retry of a message that already confirmed something: say so, rather than
+    // letting the model re-hold (and maybe re-send) the same action.
+    if (kind === "yes" && (await handledBy(ctx.party, ctx.inboundId))) return { reply: "That's already done.", open: null };
+    return { reply: null, open: null };
+  }
+
+  // The held question must still be the LAST thing he was sent. A reminder, mail
+  // alert or brief that went out after it means his "ok" may be about THAT, so the
+  // held action lapses (review 2 blocker: "ok" to "Upaya call in 5 minutes" sent
+  // the held email). Likewise a swipe-reply that quotes some other message.
+  const stillLast = await lastOutboundCarries(ctx.party, open.echo);
+  const swipedElsewhere = !!ctx.swipeQuoted && !sameText(ctx.swipeQuoted).includes(sameText(open.echo).slice(0, 40));
+  if (!stillLast || swipedElsewhere) {
+    await cancelPending(open.id);
+    return { reply: null, open: null };
+  }
+
   if (kind === "no") {
     await cancelPending(open.id);
     return { reply: "Left it as it is.", open: null };
   }
   if (kind === "yes") {
     const claimed = await claimPending(open.id, ctx.inboundId);
-    if (!claimed) return { reply: null, open: null };
+    if (!claimed) {
+      if (await handledBy(ctx.party, ctx.inboundId)) return { reply: "That's already done.", open: null };
+      return { reply: null, open: null };
+    }
     const x = await executePending(claimed, { party: ctx.party, inboundId: ctx.inboundId });
     return { reply: x.outcome, open: null };
   }
   return { reply: null, open };
+}
+
+// Compare what was sent with what was asked. The reply is dash-stripped before it
+// is stored (Law 5), so both sides are normalised the same way; otherwise a title
+// containing a dash would silently void the question.
+function sameText(t: string): string {
+  return stripDashes(String(t || "")).replace(/\s+/g, " ").trim().toLowerCase();
+}
+async function lastOutboundCarries(party: string, echo: string): Promise<boolean> {
+  try {
+    const rows = await sbSelect<{ content: string }>(
+      "chat_messages",
+      `select=content&party=eq.${enc(party)}&role=eq.assistant&order=ts.desc&limit=1`,
+    );
+    return sameText(rows?.[0]?.content || "").includes(sameText(echo));
+  } catch {
+    return false; // cannot prove he was answering this question -> it lapses
+  }
 }
 
 export async function runConcierge(input: { messages: { role: "user" | "assistant"; content: string }[]; channel?: string; sender?: Sender; swipeAnchor?: { quotedExcerpt: string } | null; inboundId?: string | null }): Promise<ConciergeResult> {
@@ -296,7 +340,7 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // the model never runs. Otherwise any open question rides into the prompt.
   let openQuestion: PendingAction | null = null;
   try {
-    const routed = await confirmRouter({ party, lastUser, inboundId: input.inboundId });
+    const routed = await confirmRouter({ party, lastUser, inboundId: input.inboundId, swipeQuoted: input.swipeAnchor?.quotedExcerpt ?? null });
     if (routed.reply) {
       const chOut = input.channel || "portal";
       try {
@@ -341,6 +385,9 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
 
   const convo: Turn[] = history.map((m) => ({ role: m.role, content: m.content }));
   const runs: { name: string; ok: boolean; result?: any }[] = [];
+  // The exact question a destructive tool was held on this turn. Code, not the model,
+  // puts it at the end of the reply, so what he answers is always what will run.
+  let heldEcho: string | null = null;
   let reply = "";
   // Skeptic #1/#2/#5: a single owner "yes" must not unlock a BATCH of destructive
   // actions. At most ONE destructive tool executes per turn; a 2nd is refused and
@@ -412,6 +459,7 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
         }
         const r = await runAction(tu.name, tu.input || {}, { party, lastUser, inboundId: input.inboundId, priorRuns: runs.length });
         runs.push({ name: tu.name, ok: r.ok, result: r.ok ? r.result : { summary: r.error } });
+        if (r.held) heldEcho = r.held.echo;
         // A confirmation executes a DIFFERENT tool (the held delete/send). Record that
         // tool as run too, so the honesty rail sees "removed all 4" as backed.
         if (tu.name === "confirm_pending_action" && r.ok && r.result?.executed_tool) {
@@ -436,6 +484,11 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // JENSEN-DOCTRINE Law 5 enforcement — strip every em/en dash from the reply
   // BEFORE persisting + delivery. Same canonical form lands in chat_messages
   // and on the user's WhatsApp. Belt-and-braces with the chokepoint in sendWhatsApp.
+  if (heldEcho) {
+    // The question goes last and verbatim. The model's own wording of it (if any)
+    // is removed so he is never asked twice in one message.
+    reply = `${reply.split(heldEcho).join("").trim()}\n\n${heldEcho}`.trim();
+  }
   reply = stripDashes(reply);
 
   // persist to the shared chat log + capture durable facts (non-blocking best-effort).

@@ -407,7 +407,7 @@ check("seam.21 DONE-resolution route is owner-only post-unlock, sweep-permitted 
   const src = read("app/api/whatsapp/route.ts");
   const doneIdx = src.indexOf("DETERMINISTIC DONE-RESOLUTION");
   if (doneIdx === -1) return "DONE-resolution marker missing";
-  const conditional = src.slice(doneIdx, doneIdx + 1000);
+  const conditional = src.slice(doneIdx, doneIdx + 2400);
   if (!/sender\.role === ["']owner["']/.test(conditional)) {
     return "DONE-resolution does not gate on owner tier — admin 'Done' would corrupt Jensen's board post-unlock";
   }
@@ -814,10 +814,13 @@ check("seam.84 plaintext_credential does NOT eat meeting invites: Zoom ?pwd= + T
 check("seam.85 the gate HOLDS with a question written by CODE from the real rows, and the held args are exactly those rows (review blocker B)", () => {
   const src = read("lib/concierge/dispatch.ts");
   const gate = src.slice(src.indexOf("async function destructiveGate("), src.indexOf("type Proposal ="));
-  if (!/describeProposal\(name, input\)/.test(gate)) return "the question is not built by describeProposal";
+  if (!/describeProposal\(name, input, ctx\)/.test(gate)) return "the question is not built by describeProposal";
   if (!/args: d\.args/.test(gate)) return "the held args are not the args describeProposal resolved (echo and execution can drift)";
   if (!/echo: d\.echo/.test(gate)) return "the held question is not the code-written echo";
-  if (!/word for word/.test(gate)) return "the model is not told to relay the question verbatim";
+  // Stronger than asking the model to copy it: code hands the question back in
+  // structured form and appends it verbatim itself (see seam.99).
+  if (!/held: \{ id: pending\.id, echo: pending\.echo \}/.test(gate)) return "the held question is not handed back in structured form for code to append";
+  if (!/do not repeat or rephrase it/.test(gate)) return "the model may restate the question, so he could be asked twice or a paraphrase could stand in for it";
   if (!/Do not say it is done/.test(gate)) return "the gate does not forbid claiming completion";
   const dp = src.slice(src.indexOf("export async function describeProposal"), src.indexOf("export async function executePending"));
   if (!/const args = \{ ids: rows\.map/.test(dp)) return "delete_event holds the ids ASKED for instead of the rows that exist";
@@ -914,7 +917,9 @@ check("seam.92 a held action is answerable by exactly ONE reply; a later casual 
   if (!/if \(a\.offered_to\) \{ await setValue\(r\.key, \{ \.\.\.a, status: "cancelled" \}\)/.test(pa)) return "a proposal that already had its reply is not cancelled";
   if (!/value->>offered_to=is\.null/.test(pa)) return "binding a proposal to an inbound is not atomic";
   if (!/if \(a\.offered_to !== inboundId\) return null/.test(pa)) return "claimPending accepts a confirmation from an inbound the question was not offered to";
-  if (!/status: "cancelled" \}\);\n    \}\n    if \(same\) return same;/.test(pa)) return "proposing does not cancel older open questions (two questions could be in flight)";
+  const propose = pa.slice(pa.indexOf("export async function proposePending"), pa.indexOf("export async function offerPending"));
+  if (!/await setValue\(r\.key, \{ \.\.\.r\.value, status: "cancelled" \}\)/.test(propose)) return "proposing does not cancel older open questions (two questions could be in flight)";
+  if (!/offered_to: null,/.test(propose)) return "re-asking the identical action does not re-arm it; his next yes would cancel it (review 2, finding 2)";
   return null;
 });
 
@@ -923,7 +928,9 @@ check("seam.93 the words a human reads after a confirmation come from what ACTUA
   const ra = src.slice(src.indexOf("export async function runAction("));
   if (!/\(result as any\)\.ok === false\) \{\n      return \{ ok: false/.test(ra)) return "a handler's own {ok:false} is still wrapped as success (a failed email reads as 'Sent.')";
   const d = src.slice(src.indexOf("export function describeOutcome"));
-  if (!/if \(!r\.ok\) return `That did not go through/.test(d)) return "a failed action can still produce a success line";
+  if (!/if \(!r\.ok\) \{/.test(d) || !/That did not go through, so nothing changed\./.test(d)) return "a failed action can still produce a success line";
+  if (!/I could not confirm that went out/.test(d)) return "a failed SEND can still promise 'nothing changed' (the mail may already have left)";
+  if (/String\(r\.error/.test(d)) return "a raw error string can reach Jensen";
   if (!/r\.result\.deleted\.length/.test(d)) return "the deleted count is not taken from the rows actually deleted";
   if (!/already gone/.test(d)) return "zero rows deleted can still read as 'Done'";
   if (!/Test turn/.test(d)) return "a simulated dev turn can still read as 'Done. Cleared'";
@@ -939,6 +946,81 @@ check("seam.94 a test turn can never send email, invite or ring a phone from Jen
     if (!set.includes(`"${t}"`)) return `${t} is not walled on a non-Jensen turn`;
   }
   if (!/TENANT_WRITES\.has\(name\) \|\| OUTWARD_SENDS\.has\(name\)/.test(src)) return "skipTenantWriteForDev ignores OUTWARD_SENDS";
+  return null;
+});
+
+check("seam.95 a bare 'done' answers the reminder JUST sent, never the newest task (21 Sep: closed 'Message Stéphane' for the Marisa ping)", () => {
+  const src = read("app/api/whatsapp/route.ts");
+  const i = src.indexOf("DETERMINISTIC DONE-RESOLUTION");
+  const block = src.slice(i, i + 2400);
+  if (/open\[0\]/.test(block)) return "the done path still ticks open[0], the most recently created task";
+  if (!/pingedJustNow\(\)/.test(block)) return "the done path is not anchored to the reminder just sent";
+  const helper = src.slice(src.indexOf("async function pingedJustNow"), src.indexOf("export async function POST("));
+  if (!/reminded_at=gte\./.test(helper)) return "the anchor does not read reminded_at";
+  if (!/outcome=is\.null/.test(helper)) return "the anchor can re-close an event already concluded";
+  if (!/< 20 \* 60_000\) return null/.test(helper)) return "two pings close together still resolve to a guess instead of the brain";
+  if (!/completeEvent\(\{ id: target\.id \}\)/.test(block)) return "the anchored event is not the one completed";
+  return null;
+});
+
+check("seam.96 'remind me' becomes a reminder that PINGS (set_reminder -> timed event), never a silent task", () => {
+  const tools = read("lib/concierge/tools.ts");
+  if (!/\{ name: "set_reminder"/.test(tools)) return "set_reminder tool missing";
+  if (!/A task NEVER pings him/.test(tools)) return "create_task does not steer 'remind me' away from itself";
+  const d = read("lib/concierge/dispatch.ts");
+  const c = d.slice(d.indexOf('case "set_reminder"'), d.indexOf('case "create_event"'));
+  if (!/ops\.createEvent\(ev\)/.test(c)) return "set_reminder does not create a calendar event (the only thing the reminder cron pings)";
+  if (!/time: input\.time \|\| "09:00"/.test(c)) return "set_reminder has no default time, so a dateless reminder would never fire";
+  if (!/reconcileEventDate\(ctx, ev\)/.test(c)) return "set_reminder skips the weekday backstop";
+  if (!/"create_event", "set_reminder"/.test(d)) return "set_reminder is not behind the dev write wall";
+  if (!/"set_reminder",\n  "create_entity"/.test(tools)) return "set_reminder does not back a 'reminder set' claim for the honesty rail";
+  const router = read("lib/concierge/router.ts");
+  const cc = router.slice(router.indexOf("const CROSS_CUTTING"), router.indexOf("];", router.indexOf("const CROSS_CUTTING")));
+  if (!/"set_reminder"/.test(cc)) return "set_reminder is not in every lane";
+  return null;
+});
+
+check("seam.97 a killed message never reaches him as the cryptic 'Tell me more so I can handle it.' (6 briefs, 17-22 Sep)", () => {
+  const cfg = read("lib/bot/guards-config.ts");
+  if (/reaskPhrase: 'Tell me more so I can handle it\.'/.test(cfg)) return "the cryptic phrase is back as the drop body";
+  const st = read("lib/sendTextAndLog.ts");
+  if (!/if \(sanitized\.dropped\) \{/.test(st) || !/devPhone\(\)/.test(st)) return "a killed scheduled message pages no one";
+  return null;
+});
+
+check("seam.98 a held question is answerable only while it is still the LAST thing he was sent (review 2 blocker)", () => {
+  const loop = read("lib/concierge/loop.ts");
+  const r = loop.slice(loop.indexOf("export async function confirmRouter"), loop.indexOf("export async function runConcierge"));
+  if (!/lastOutboundCarries\(ctx\.party, open\.echo\)/.test(r)) return "a reminder or mail alert sent after the question can still receive his 'ok'";
+  if (!/swipedElsewhere/.test(r)) return "a swipe-reply to a different message can still confirm the held action";
+  if (!/stripDashes/.test(r)) return "the comparison ignores Law 5 dash stripping; a title with a dash would void every question";
+  if (!/handledBy\(ctx\.party, ctx\.inboundId\)/.test(r)) return "a retried 'yes' falls through to the model instead of 'already done'";
+  if (!/confirmRouter\(\{ party, lastUser, inboundId: input\.inboundId, swipeQuoted:/.test(loop)) return "the swipe anchor is not passed to the router";
+  return null;
+});
+
+check("seam.99 code, not the model, puts the held question at the end of the reply, verbatim", () => {
+  const loop = read("lib/concierge/loop.ts");
+  if (!/if \(r\.held\) heldEcho = r\.held\.echo;/.test(loop)) return "the held question is not captured from the tool result";
+  const i = loop.indexOf("if (heldEcho) {");
+  const j = loop.indexOf("reply = stripDashes(reply);");
+  if (i < 0) return "the held question is never appended";
+  if (j >= 0 && i > j) return "the question is appended after dash-stripping; stored and sent text would differ";
+  if (loop.indexOf("reply = await honestReply(reply") > i) return "the honesty rail runs after the question is appended and could rewrite it";
+  return null;
+});
+
+check("seam.100 an outward SEND goes out only on his own plain 'yes', never on the model's reading (review 2, finding 6)", () => {
+  const d = read("lib/concierge/dispatch.ts");
+  const fn = d.slice(d.indexOf("async function confirmPendingAction("));
+  if (!/if \(OUTWARD_SENDS\.has\(open\.tool\)\) \{/.test(fn)) return "the model can confirm a send through confirm_pending_action";
+  if (!/rearmPending\(open\.id, ctx\?\.inboundId\)/.test(fn)) return "a yes-in-other-words to a send does not re-arm it for his plain yes (it would silently lapse)";
+  if (!/held: \{ id: again\.id, echo: again\.echo \}/.test(fn)) return "the re-ask is not verbatim; the router would not recognise it";
+  const g = d.slice(d.indexOf("async function destructiveGate("), d.indexOf("type Proposal ="));
+  if (!/recentlyExecutedSame/.test(g)) return "a send that just went out can be re-held and sent twice";
+  const dp = d.slice(d.indexOf("export async function describeProposal"), d.indexOf("export async function executePending"));
+  if (!/fullBody\(input\?\.body\)/.test(dp)) return "he confirms a send without seeing the body that will go out";
+  if (/and \$\{rows\.length - 6\} more/.test(dp)) return "a delete still hides rows behind 'and N more'";
   return null;
 });
 
