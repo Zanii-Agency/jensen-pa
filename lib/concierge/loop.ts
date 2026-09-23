@@ -6,7 +6,7 @@ import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
 import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
 import { runAction, isDestructive, classifyReply, executePending } from "./dispatch";
-import { offerPending, claimPending, cancelPending, findOpenHold, type PendingAction } from "./pending-actions";
+import { claimOnPortal, cancelPending, findOpenHold, type PendingAction } from "./pending-actions";
 import { sbSelect, enc } from "./rest";
 import { honestReply, isUnbackedClaim } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
@@ -146,7 +146,7 @@ async function buildSystem(lastUser: string, sender?: Sender, onboarding = false
     `DESTRUCTIVE ACTIONS (Doctrine Law 8): for any delete, send, call or invite (delete_task, delete_event, delete_finance, delete_entity, delete_note, delete_contact, delete_document, forget_memory, reply_email, send_email, call_owner, send_meeting_invite), call the tool DIRECTLY as soon as Jensen asks. Do not ask him first yourself and never pass any confirm flag: the system HOLDS the action and hands you the exact question to relay. Relay that question word for word. Nothing has happened until his next message confirms it. To stop a reminder series, query_calendar for every matching row and pass all their ids to delete_event in ONE call, so he confirms once. NEVER combine a destructive action with an additive one from a compound command ("add X and delete Y"); do the additive one and hold the destructive one.`,
     `MAIL PROPOSAL: when a recent assistant message in this thread is a proposed email reply (it contains "My draft reply" and an "(email_id: ...)" tag) and Jensen gives any clear go-ahead ("yes", "send", "send it", "lfg", "looks good"), call reply_email with that exact email_id and the proposed draft body verbatim. The system holds it and gives you one short confirmation question to relay. If he says "change to: <text>", "edit: <text>" or "send: <text>", call reply_email with body=<text>. If he says "skip", "no", "drop" or "ignore", acknowledge in one line and do not call it. If several proposals are pending, bind to the most recent unless he names a different sender or subject. Never invent an email_id.`,
     `MEETING TASKS PROPOSAL: after Digital Jensen wraps a meeting I send Jensen the summary and a NUMBERED list of proposed action items that are NOT yet on his board. When his reply responds to that proposal, call accept_meeting_tasks (never create_task): "add all" / "yes" / "accept" / "add them" leaves numbers empty (adds all); "add 1 and 3" / "1, 3" / "just the first two" passes numbers like [1,3]; "skip" / "no" / "drop them" passes skip:true. I NEVER put proposed meeting tasks on his board until he accepts, and I never recreate them by hand. Once accepted, confirm how many landed.`,
-    `DONE-RESOLUTION: when Jensen sends a bare confirmation ("Done", "Did it", "Yes done", "Handled", "Yes") and the most recent thread is about a specific task or reminder, IMMEDIATELY call complete_task with the matching id from the RECENT OPEN TASKS list below. Do not ask "which one". Pick the most recently mentioned by name or the most recently created. If genuinely ambiguous between two, name them in one short reply and ask. Never silently move on.`,
+    `DONE-RESOLUTION: when Jensen sends a bare "done" / "did it" / "handled", resolve it against the LAST REMINDER I SENT HIM (the most recent "Reminder. <title> at <time>" message in this thread). If that is a calendar event, call complete_event for it; if it is a task, complete_task. If that reminder is one of several pings for the SAME thing that are still due to fire (for example "Send payment for DJ" and its "(reminder 2)", "(reminder 3)" rows), complete this one AND call delete_event with the ids of the remaining pings, so he is asked once whether to stop the rest. NEVER pick "the most recently created" task or anything he was not just reminded about: on 21 Sep that closed "Message Stéphane" when he was answering a Marisa Peers reminder. If there is no recent reminder or it is unclear, ask which one in one short line.`,
     `TIME INTERPRETATION (be exact, never approximate): "noon" = 12:00. "midnight" = 00:00. "morning" without specifics = 09:00. "afternoon" = 14:00. "evening" without specifics = 18:00. "night" = 21:00. When the user gives a relative day ("tomorrow", "Friday", "next Monday"), resolve to the actual calendar date in Dubai time. When the user says "at 3pm" it is 15:00, "at 3am" is 03:00. Pick the soonest matching date and proceed; only ask if the input is structurally incomplete (no time AND no date), never to second-guess a clear request.`,
     `COVEY QUADRANT MAPPING: Jensen's life runs on four quadrants. When he describes something — derive the quadrant from his words:
 - Q1 (urgent+important): "urgent", "ASAP", "today", "deadline", "time sensitive", "fire", "critical", "do this now", "immediately", "by EOD", "by [time]"
@@ -172,7 +172,9 @@ Default to Q2 when unclear. When calling create_task, ALWAYS pass the quadrant y
       : "";
 
   const openQuestionBlock = openQuestion
-    ? `HELD ACTION WAITING (id ${openQuestion.id}). Jensen was shown: "${openQuestion.echo}" with Yes / No buttons. Nothing you do can confirm it: only his tap on Yes runs it. If his message means yes, tell him in one line to tap Yes on that message. If he wants it changed ("keep Friday's", "only the 5pm one"), make the tool call for the changed set; that replaces it and he gets new buttons. If his message is about something else, just answer it. Never say the held action is done.`
+    ? (channel === "portal"
+        ? `HELD ACTION WAITING (id ${openQuestion.id}). Jensen was asked on this screen: "${openQuestion.echo}" Nothing you do can confirm it: it runs only when he replies with a plain "yes". If his message means yes in other words, tell him in one line to reply "yes". If he does not want it, call cancel_held_action. If he wants it changed ("keep Friday's"), make the tool call for the changed set; that replaces it. If his message is about something else, just answer it. Never say the held action is done.`
+        : `HELD ACTION WAITING (id ${openQuestion.id}). Jensen was sent: "${openQuestion.echo}" with Yes / No buttons. Nothing you do can confirm it: only his tap on Yes runs it. If his message means yes, tell him in one line to tap Yes on that message. If he does not want it ("don't send it", "cancel that"), call cancel_held_action. If he wants it changed ("keep Friday's"), make the tool call for the changed set; that replaces it and he gets new buttons. If his message is about something else, just answer it. Never say the held action is done.`)
     : "";
 
   const tail = [
@@ -275,18 +277,16 @@ export async function confirmRouter(ctx: {
   const kind = classifyReply(ctx.lastUser);
 
   if (ctx.channel === "portal") {
-    // Portal: a synchronous screen with no scheduled pushes landing in it, so the
-    // next portal message answers the question shown right above it.
-    const open = await offerPending(ctx.party, ctx.inboundId, "portal");
+    // Portal: a synchronous screen with no scheduled pushes landing in it. Code keeps
+    // the held question as the last line of every portal reply while it is open, so
+    // his bare "yes" here answers exactly what is on his screen.
+    const open = await findOpenHold(ctx.party, "portal");
     if (!open) return { reply: null, open: null };
-    if (!(await lastOutboundCarries(ctx.party, open.echo, "portal"))) {
-      await cancelPending(open.id);
-      return { reply: null, open: null };
-    }
-    if (kind === "no") { await cancelPending(open.id); return { reply: "Left it as it is.", open: null }; }
-    if (kind === "yes") {
-      const claimed = await claimPending(open.id, ctx.inboundId);
-      if (!claimed) return { reply: null, open: null };
+    const onScreen = await lastOutboundCarries(ctx.party, open.echo, "portal");
+    if (onScreen && kind === "no") { await cancelPending(open.id); return { reply: "Left it as it is.", open: null }; }
+    if (onScreen && kind === "yes") {
+      const claimed = await claimOnPortal(open.id, ctx.party, ctx.inboundId);
+      if (!claimed) return { reply: null, open };
       const x = await executePending(claimed, { party: ctx.party, inboundId: ctx.inboundId });
       return { reply: x.outcome, open: null };
     }
@@ -295,11 +295,11 @@ export async function confirmRouter(ctx: {
 
   // WhatsApp: NOTHING executes from typed text. A held action runs only on a tap of
   // its own button, handled in the webhook before this. Typed replies are only
-  // intercepted when the button message is the last thing he was sent, and then
-  // only harmlessly: "yes" gets the buttons again, "no" cancels (nothing happens).
+  // intercepted when the buttons are the last thing he was sent, and then only
+  // harmlessly: "yes" gets the buttons again, "no" cancels (nothing happens).
   const open = await findOpenHold(ctx.party, "whatsapp");
   if (!open) return { reply: null, open: null };
-  const answeringButtons = await lastOutboundCarries(ctx.party, open.echo, "whatsapp");
+  const answeringButtons = await lastOutboundIsButtons(ctx.party);
   if (answeringButtons && kind === "no") {
     await cancelPending(open.id);
     return { reply: "Left it as it is.", open: null };
@@ -308,6 +308,21 @@ export async function confirmRouter(ctx: {
     return { reply: "Tap Yes on the message below to confirm.", open: null, held: { id: open.id, echo: open.echo } };
   }
   return { reply: null, open };
+}
+
+// True when the last WhatsApp message he was sent is a confirmation-button message
+// that actually went out (sendButtonsAndLog marks undelivered ones). Works for a
+// long question too, where the button body is "Confirm what I just sent above?".
+async function lastOutboundIsButtons(party: string): Promise<boolean> {
+  try {
+    const rows = await sbSelect<{ content: string }>(
+      "chat_messages",
+      `select=content&party=eq.${enc(party)}&role=eq.assistant&channel=eq.whatsapp&order=ts.desc&limit=1`,
+    );
+    return String(rows?.[0]?.content || "").trimEnd().endsWith("[Yes] [No, keep it]");
+  } catch {
+    return false;
+  }
 }
 
 // Compare what was sent with what was asked. The reply is dash-stripped before it
@@ -335,12 +350,16 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // Jensen; his messages and memory never mix into Jensen's, and only the admin
   // toolset can read Jensen's chats (one-way).
   const party = (input.sender?.role ?? "owner") !== "owner" ? "taona" : "jensen";
+  // One channel value for the whole turn, so where a hold is stored and how its
+  // question is shown can never disagree (review 4 note: undefined meant WhatsApp
+  // in one place and portal in another).
+  const chan: "whatsapp" | "portal" = input.channel === "whatsapp" ? "whatsapp" : "portal";
 
   // Confirm-router first: a bare yes/no to a held action is settled by code and
   // the model never runs. Otherwise any open question rides into the prompt.
   let openQuestion: PendingAction | null = null;
   try {
-    const routed = await confirmRouter({ party, lastUser, inboundId: input.inboundId, channel: input.channel });
+    const routed = await confirmRouter({ party, lastUser, inboundId: input.inboundId, channel: chan });
     if (routed.reply) {
       const chOut = input.channel || "portal";
       try {
@@ -457,7 +476,7 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
           }
           destructiveUsedThisTurn++;
         }
-        const r = await runAction(tu.name, tu.input || {}, { party, lastUser, inboundId: input.inboundId, priorRuns: runs.length, channel: input.channel === "portal" ? "portal" : "whatsapp" });
+        const r = await runAction(tu.name, tu.input || {}, { party, lastUser, inboundId: input.inboundId, priorRuns: runs.length, channel: chan });
         runs.push({ name: tu.name, ok: r.ok, result: r.ok ? r.result : { summary: r.error } });
         if (r.held) held = r.held;
         toolResults.push({
@@ -479,13 +498,14 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // JENSEN-DOCTRINE Law 5 enforcement — strip every em/en dash from the reply
   // BEFORE persisting + delivery. Same canonical form lands in chat_messages
   // and on the user's WhatsApp. Belt-and-braces with the chokepoint in sendWhatsApp.
-  if (held) {
-    // Never asked twice: drop any copy of the question the model wrote itself.
-    reply = reply.split(held.echo).join("").trim();
-    // Portal: shown as the last line of the same reply, answered by the next message.
-    // WhatsApp: the webhook sends it as buttons right after this reply.
-    if ((input.channel || "portal") === "portal") reply = `${reply}\n\n${held.echo}\nReply yes to confirm.`.trim();
-  }
+  // The question on screen is always the one that will run. WhatsApp: the webhook
+  // sends it as buttons after this reply. Portal: code keeps it as the LAST line of
+  // every reply while it is open (a new hold, or one still waiting), so a later bare
+  // "yes" there always answers exactly what he is looking at.
+  const showOnPortal = held?.echo ?? (chan === "portal" ? openQuestion?.echo : undefined);
+  const q = held?.echo ?? showOnPortal;
+  if (q) reply = reply.split(q).join("").trim(); // never asked twice
+  if (chan === "portal" && showOnPortal) reply = `${reply}\n\n${showOnPortal}\nReply yes to confirm.`.trim();
   reply = stripDashes(reply);
 
   // persist to the shared chat log + capture durable facts (non-blocking best-effort).

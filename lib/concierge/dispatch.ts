@@ -339,9 +339,12 @@ function whenOf(date?: string, time?: string): string {
   const day = isNaN(d.getTime()) ? date : d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
   return time ? `${day} ${String(time).slice(0, 5)}` : day;
 }
+// He confirms exactly what goes out, so the body is shown in FULL; anything too
+// long to show is refused rather than cut (review 4: a truncated body with a
+// "remaining characters" note was still being approved unseen).
+const MAX_CONFIRMABLE_BODY = 3000;
 function fullBody(b: unknown): string {
-  const t = String(b ?? "").trim();
-  return t.length <= 3000 ? t : `${t.slice(0, 3000)}\n(and ${t.length - 3000} more characters)`;
+  return String(b ?? "").trim();
 }
 function idList(input: any): string[] {
   const raw = Array.isArray(input?.ids) && input.ids.length
@@ -408,9 +411,11 @@ export async function describeProposal(name: string, input: any, ctx?: { party?:
       return { args: { id: r.id }, echo: `That forgets: ${q(r.fact)}. Confirm?` };
     }
     case "send_email":
+      if (fullBody(input?.body).length > MAX_CONFIRMABLE_BODY) return { echo: "", args: {}, nothing: `that email is ${fullBody(input?.body).length} characters, too long for Jensen to read and approve on WhatsApp. Ask him to shorten it.` };
       // The body he confirms IS the body that sends (review 2, finding 5).
       return { args: input, echo: `That sends this email to ${input?.to}, subject ${q(input?.subject)}:\n\n${fullBody(input?.body)}\n\nSend it?` };
     case "reply_email": {
+      if (fullBody(input?.body).length > MAX_CONFIRMABLE_BODY) return { echo: "", args: {}, nothing: `that reply is ${fullBody(input?.body).length} characters, too long for Jensen to read and approve on WhatsApp. Ask him to shorten it.` };
       let to = "";
       try { const f: any = await readUnified(input?.id); to = f?.fromEmail || ""; }
       catch { return { echo: "", args: {}, nothing: "I could not open that email just now. Tell Jensen and try again in a moment; do not say it is gone." }; }
@@ -695,6 +700,16 @@ export async function runAction(
       // Routed through create_event so it gets the same weekday backstop, dev wall
       // and receipt. (16 Sep: "remind me in two weeks" became a task, which is never
       // pushed, while the bot told him "Reminder set for 5 October".)
+      // Cancel ONLY. The model may retire a held action when he says "don't send it" /
+      // "cancel that" in any words; it can never confirm one (review 4, finding 5).
+      case "cancel_held_action": {
+        const { findOpenHold, cancelPending } = await import("./pending-actions");
+        const open = await findOpenHold(ctx?.party || "jensen", ctx?.channel === "portal" ? "portal" : "whatsapp");
+        if (!open) { result = { cancelled: false, note: "There was nothing waiting." }; break; }
+        await cancelPending(open.id);
+        result = { cancelled: true, what: open.echo.split("\n")[0].slice(0, 160) };
+        break;
+      }
       case "set_reminder": {
         const ev: any = {
           title: String(input.what || input.title || "").trim(),
@@ -705,12 +720,23 @@ export async function runAction(
           recurrenceUntil: input.recurrenceUntil || undefined,
         };
         await reconcileEventDate(ctx, ev);
-        // A reminder whose moment has already passed today would never ping (the
-        // cron only looks ahead). Ask for a time instead of claiming it is set.
+        // The reminder cron pings 5 minutes ahead and only looks forward, so a
+        // reminder less than ~6 minutes out (or already past) would never ping.
         const [hh, mm] = String(ev.time).split(":").map(Number);
         const nowDubai = new Date(Date.now() + 4 * 3_600_000);
-        const passed = ev.date === dubaiToday() && (hh * 60 + (mm || 0)) <= nowDubai.getUTCHours() * 60 + nowDubai.getUTCMinutes();
-        if (passed) { result = { ok: false, error: `${ev.time} today has already passed. Ask Jensen what time today (or which day) he wants the reminder.` }; break; }
+        const minsNow = nowDubai.getUTCHours() * 60 + nowDubai.getUTCMinutes();
+        const tooSoon = ev.date === dubaiToday() && (hh * 60 + (mm || 0)) < minsNow + 6;
+        if (tooSoon && ev.recurrence) {
+          // "Every Monday", said on a Monday after 09:00: start from the NEXT one.
+          const d = new Date(`${ev.date}T00:00:00Z`);
+          if (ev.recurrence === "weekly") d.setUTCDate(d.getUTCDate() + 7);
+          else if (ev.recurrence === "monthly") d.setUTCMonth(d.getUTCMonth() + 1);
+          else if (ev.recurrence === "yearly") d.setUTCFullYear(d.getUTCFullYear() + 1);
+          ev.date = d.toISOString().slice(0, 10);
+        } else if (tooSoon) {
+          result = { ok: false, error: `${ev.time} today is too soon or already passed for a reminder to ping. Ask Jensen what time he wants it.` };
+          break;
+        }
         result = await ops.createEvent(ev); break;
       }
       case "create_event": { await reconcileEventDate(ctx, input); await attachMeetingLink(ctx, input); result = await ops.createEvent(input); break; }

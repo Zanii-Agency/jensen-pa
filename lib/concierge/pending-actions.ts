@@ -15,8 +15,9 @@
 //    exact action, so an "ok" to a reminder, a stale message, a swipe, or text
 //    injected into the conversation can never fire it. (Three rounds of review
 //    showed that inferring what a typed "yes" answers is not safely solvable.)
-//  - Portal: a synchronous screen with no scheduled pushes, so the next portal
-//    message may answer it with a bare yes (offerPending + claimPending).
+//  - Portal: a synchronous screen with no scheduled pushes landing in it. His bare
+//    "yes" confirms only while the question is the last thing on that screen
+//    (checked by the router), then claimOnPortal.
 //  - Either way: one question in flight per party and channel; the proposing
 //    message can never confirm it; the claim is an atomic, status-guarded PATCH
 //    (two racing confirmations, exactly one executes; proven live 2026-09-23).
@@ -36,7 +37,7 @@ export type PendingAction = {
   echo: string;                        // the exact question, written by code from the real rows
   proposed_text: string;               // the owner message that asked for it (for the name-mismatch wall)
   proposed_inbound_id: string | null;
-  offered_to: string | null;           // the single inbound allowed to answer it
+  offered_to: string | null;           // unused since v4 (kept so older rows still parse)
   status: PendingStatus;
   confirm_inbound_id: string | null;
   result: any;
@@ -141,37 +142,6 @@ export async function proposePending(input: {
   }
 }
 
-// Called once at the start of every turn. Returns the proposal THIS inbound may
-// answer, or null. Binds an unoffered proposal to this inbound; cancels any
-// proposal that already had its one reply (rule 2); never offers a proposal to
-// the inbound that created it (rule 3).
-export async function offerPending(party: string, inboundId: string | null | undefined, channel = "portal"): Promise<PendingAction | null> {
-  if (!inboundId) return null;
-  try {
-    const open = await openFor(party, channel);
-    let answerable: PendingAction | null = null;
-    for (const r of open) {
-      const a = r.value;
-      if (!isLive(a)) { await setValue(r.key, { ...a, status: "expired" }); continue; }
-      if (a.proposed_inbound_id === inboundId) continue;         // made this very turn
-      if (a.offered_to === inboundId) { answerable ??= a; continue; } // retry of the same turn
-      if (a.offered_to) { await setValue(r.key, { ...a, status: "cancelled" }); continue; } // had its reply
-      const bound: PendingAction = { ...a, offered_to: inboundId };
-      const won = await sbUpdateReturning<{ value: PendingAction }>(
-        "kv",
-        `key=eq.${enc(r.key)}&${STATUS_PENDING}&value->>offered_to=is.null`,
-        { value: bound, updated_at: Date.now() },
-      );
-      if (won.length === 1) answerable ??= won[0].value;
-    }
-    return answerable;
-  } catch {
-    return null;
-  }
-}
-
-// Claim for execution. Only the inbound the proposal was offered to can claim
-// it, never the proposing one, and only once.
 export async function findOpenHold(party: string, channel: string): Promise<PendingAction | null> {
   try {
     return (await openFor(party, channel)).map((r) => r.value).find(isLive) ?? null;
@@ -211,19 +181,22 @@ export async function holdStatus(id: string): Promise<PendingAction | null> {
   }
 }
 
-export async function claimPending(id: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
+// Claim on the PORTAL: his own later bare "yes", accepted by the router only when
+// the question is the last thing on his screen. Same guarantees as a tap: still
+// pending, not expired, same party, a PORTAL hold, never the proposing message,
+// atomic.
+export async function claimOnPortal(id: string, party: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
   if (!inboundId) return null;
   try {
     const rows = await sbSelect<{ key: string; value: PendingAction }>("kv", `select=key,value&${byId(id)}&limit=1`);
     const row = rows?.[0];
     const a = row?.value;
-    if (!row || !a || a.status !== "pending" || !isLive(a)) return null;
-    if (a.offered_to !== inboundId) return null;                  // not this turn's question
-    if (a.proposed_inbound_id === inboundId) return null;         // SELF-CONFIRM: same inbound proposed and confirmed
+    if (!row || !a || a.status !== "pending" || !isLive(a) || a.party !== party || a.channel !== "portal") return null;
+    if (a.proposed_inbound_id === inboundId) return null; // SELF-CONFIRM: the proposing message cannot confirm itself
     const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: inboundId };
     const won = await sbUpdateReturning<{ value: PendingAction }>(
       "kv",
-      `key=eq.${enc(row.key)}&${STATUS_PENDING}&value->>offered_to=eq.${enc(inboundId)}`,
+      `key=eq.${enc(row.key)}&${STATUS_PENDING}`,
       { value: claimed, updated_at: Date.now() },
     );
     return won.length === 1 ? won[0].value : null;
@@ -236,12 +209,15 @@ export async function claimPending(id: string, inboundId: string | null | undefi
 // refuse re-holding an outward send that already went out, so a double-tap can
 // never send the same email twice.
 export async function recentlyExecutedSame(party: string, tool: string, args: any, withinMs = 10 * 60_000): Promise<PendingAction | null> {
+  const base = `select=value&${partyLike(party)}&value->>args_hash=eq.${enc(argsHash(tool, args))}&updated_at=gte.${Date.now() - withinMs}&limit=1`;
   try {
-    const rows = await sbSelect<{ value: PendingAction }>(
-      "kv",
-      `select=value&${partyLike(party)}&value->>status=eq.executed&value->>error=is.null&value->>args_hash=eq.${enc(argsHash(tool, args))}&updated_at=gte.${Date.now() - withinMs}&limit=1`,
-    );
-    return rows?.[0]?.value ?? null;
+    // Sent successfully...
+    const sent = await sbSelect<{ value: PendingAction }>("kv", `${base}&value->>status=eq.executed&value->>error=is.null`);
+    if (sent?.[0]) return sent[0].value;
+    // ...or still being sent right now: a second request must not send it twice
+    // (review 4, finding 2).
+    const running = await sbSelect<{ value: PendingAction }>("kv", `${base}&value->>status=eq.confirmed`);
+    return running?.[0]?.value ?? null;
   } catch {
     return null;
   }

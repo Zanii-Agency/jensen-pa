@@ -25,7 +25,7 @@ export async function sendTextAndLog(
   to: string,
   body: string,
   opts?: { force?: boolean; party?: string; dev?: boolean }
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; dropped?: boolean }> {
   // v0.2 (2026-06-12): the PRIMITIVE sendWhatsApp now enforces the wall for
   // every caller. This wrapper still runs sanitizeReply FIRST so that the
   // chat_messages transcript records exactly what ships (never diverging from
@@ -88,7 +88,10 @@ export async function sendTextAndLog(
       // best-effort patch; the transcript still exists without the wamid join key.
     }
   }
-  return { ok: sendResult.ok };
+  // dropped: the wall killed the body, so what reached him was the polite line,
+  // not this message. A caller that needs him to have SEEN the text (a question
+  // he is about to tap Yes on) must treat this as not delivered.
+  return { ok: sendResult.ok, dropped: sanitized.dropped };
 }
 
 // The chokepoint for confirmation buttons (Law 2: every outbound is logged before
@@ -111,14 +114,20 @@ export async function sendButtonsAndLog(
   }).select("id").single();
   const rowId: number | null = (ins?.data as any)?.id ?? null;
   const r = await sendWhatsAppInteractive(to, body, buttons);
-  if (r.dropped) {
-    const dev = devPhone();
-    if (dev) sendWhatsAppRaw(dev, `[Dorje wall] blocked a confirmation to the client. Original: ${String(body).slice(0, 500)}`, { force: true }).catch(() => {});
-    await sendWhatsAppRaw(to, JENSEN_BOT_GUARDS_CONFIG.reaskPhrase);
+  if (!r.ok) {
+    // The transcript must not claim he was shown buttons he never got (review 4,
+    // finding 4): the row is marked, and the caller cancels the held action.
+    if (rowId != null) {
+      try { await admin().from("chat_messages").update({ content: `${body}\n[buttons NOT delivered]` }).eq("id", rowId); } catch { /* best effort */ }
+    }
+    if (r.dropped) {
+      const dev = devPhone();
+      if (dev) sendWhatsAppRaw(dev, `[Dorje wall] blocked a confirmation to the client. Original: ${String(body).slice(0, 500)}`, { force: true }).catch(() => {});
+    }
     return { ok: false };
   }
-  if (r.ok && r.wamid && rowId != null) {
+  if (r.wamid && rowId != null) {
     try { await admin().from("chat_messages").update({ external_id: r.wamid }).eq("id", rowId); } catch { /* best effort */ }
   }
-  return { ok: r.ok };
+  return { ok: true };
 }

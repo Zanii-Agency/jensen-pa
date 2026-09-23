@@ -78,12 +78,14 @@ export async function sendWhatsAppInteractive(
     const { kvGet } = await import("@/lib/db");
     if (await kvGet("bot_muted", false)) return { ok: false, wamid: null };
   } catch { /* fail open, as sendWhatsAppRaw does */ }
-  const cleaned = stripDashes(bodyText).slice(0, 1024);
+  let cleaned = stripDashes(bodyText).slice(0, 1024);
   if (whoIs(to).role !== "developer") {
     try {
       const { sanitizeReply } = await import("@/lib/bot-guards/index.js");
       const { JENSEN_BOT_GUARDS_CONFIG } = await import("@/lib/bot/guards-config");
-      if (sanitizeReply(cleaned, JENSEN_BOT_GUARDS_CONFIG).dropped) return { ok: false, wamid: null, dropped: true };
+      const g = sanitizeReply(cleaned, JENSEN_BOT_GUARDS_CONFIG);
+      if (g.dropped) return { ok: false, wamid: null, dropped: true };
+      cleaned = g.body; // strip-mode guards edit text; the button body must carry the edit too
     } catch { /* the wall must never break delivery; same policy as sendWhatsAppRaw */ }
   }
   try {

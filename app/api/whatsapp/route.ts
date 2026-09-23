@@ -122,9 +122,9 @@ async function recentHistory(party: string): Promise<{ role: "user" | "assistant
 //    one or all of them; the DJ chase was titled "... (reminder 2)", "(reminder 4)").
 async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
   const since = Date.now() - 3 * 3_600_000;
-  const rows = await sbSelect<{ id: string; title: string; reminded_at: number }>(
+  const rows = await sbSelect<{ id: string; title: string; reminded_at: number; date: string; recurrence: string | null }>(
     "events",
-    `select=id,title,reminded_at&reminded_at=gte.${since}&outcome=is.null&order=reminded_at.desc&limit=1`,
+    `select=id,title,reminded_at,date,recurrence&reminded_at=gte.${since}&outcome=is.null&order=reminded_at.desc&limit=1`,
   );
   const ev = rows?.[0];
   if (!ev) return null;
@@ -133,11 +133,17 @@ async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
     `select=content&party=eq.jensen&role=eq.assistant&channel=eq.whatsapp&order=ts.desc&limit=1`,
   );
   if (!String(last?.[0]?.content || "").startsWith(`Reminder. ${ev.title} at`)) return null;
+  // A RECURRING event (weekly/monthly/yearly) gets its next occurrence created as a
+  // new row the moment it fires. That row is next week's reminder, not "the rest of
+  // a series still firing", so "done" closes this occurrence only (review 4, #3).
+  if ((ev as any).recurrence) return { id: ev.id, title: ev.title };
+  // A one-off burst of pings for the same thing on the same day (the DJ chase:
+  // "Send payment for DJ", "(reminder 2)", "(reminder 4)") IS a series: "done"
+  // could mean this one or all of them, so the brain asks.
   const base = ev.title.replace(/\s*\(reminder \d+\)\s*$/i, "").trim();
-  const today = new Date(Date.now() + 4 * 3_600_000).toISOString().slice(0, 10);
   const more = await sbSelect<{ id: string }>(
     "events",
-    `select=id&title=ilike.${enc(base + "*")}&reminded_at=is.null&outcome=is.null&date=gte.${today}&id=neq.${enc(ev.id)}&limit=1`,
+    `select=id&title=ilike.${enc(base + "*")}&reminded_at=is.null&outcome=is.null&date=eq.${enc((ev as any).date)}&id=neq.${enc(ev.id)}&limit=1`,
   );
   if (more.length) return null;
   return { id: ev.id, title: ev.title };
@@ -146,16 +152,27 @@ async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
 // A held destructive action, sent as Yes / No buttons. WhatsApp caps an
 // interactive body at 1024 chars, so a longer question (a full email body, a long
 // list) goes first as a normal message and the buttons refer to it.
+//
+// A Yes button must never sit under a question he did not actually receive (review
+// 4 blocker): if the long text was walled or failed, or the buttons themselves did
+// not go out, the held action is cancelled and he is told plainly that nothing
+// will happen.
 async function sendConfirmButtons(to: string, held: { id: string; echo: string }, party: string): Promise<void> {
+  const giveUp = async () => {
+    await cancelPending(held.id);
+    await sendTextAndLog(to, "I couldn't show you that confirmation properly, so nothing will happen. Ask me again.", { party }).catch(() => {});
+  };
   let body = held.echo;
   if (body.length > 1000) {
-    await sendTextAndLog(to, body, { party });
+    const shown = await sendTextAndLog(to, body, { party }).catch(() => ({ ok: false, dropped: false }));
+    if (!shown.ok || shown.dropped) return giveUp();
     body = "Confirm what I just sent above?";
   }
-  await sendButtonsAndLog(to, body, [
+  const sent = await sendButtonsAndLog(to, body, [
     { id: `pa:${held.id}:yes`, title: "Yes" },
     { id: `pa:${held.id}:no`, title: "No, keep it" },
-  ], { party });
+  ], { party }).catch(() => ({ ok: false }));
+  if (!sent.ok) return giveUp();
 }
 
 export async function POST(req: NextRequest) {
@@ -307,22 +324,24 @@ export async function POST(req: NextRequest) {
       const tapParty = sender.role !== "owner" ? "taona" : "jensen";
       const [, holdId, choice] = tap;
       await ops.chatAppend("user", `[tapped: ${choice.toLowerCase() === "yes" ? "Yes" : "No, keep it"}]`, "whatsapp", tapParty, { externalId: inboundWamid }).catch(() => {});
+      // What a tap on a button that can no longer run says, read from the record.
+      const why = (h: Awaited<ReturnType<typeof holdStatus>>): string =>
+        !h || h.party !== tapParty ? "I can't find that request any more. Ask me again."
+        : h.status === "confirmed" ? "Still working on that one."
+        : h.status === "executed" && h.error ? "That did not go through last time. Ask me again and I'll retry."
+        : h.status === "executed" ? "That was already done."
+        : h.status === "cancelled" ? "That one was cancelled. Ask me again if you still want it."
+        : "That request expired. Ask me again and I'll set it up fresh.";
       let out: string;
       if (choice.toLowerCase() === "no") {
         const h = await holdStatus(holdId);
         if (h && h.status === "pending" && h.party === tapParty) { await cancelPending(holdId); out = "Left it as it is."; }
-        else out = h?.status === "executed" ? "That was already done." : "Nothing to cancel there.";
+        else out = why(h);
       } else {
         const claimed = await claimByTap(holdId, tapParty, inboundWamid || `tap:${Date.now()}`);
-        if (claimed) {
-          out = (await executePending(claimed, { party: tapParty, inboundId: inboundWamid })).outcome;
-        } else {
-          const h = await holdStatus(holdId);
-          out = !h || h.party !== tapParty ? "I can't find that request any more. Ask me again."
-            : h.status === "executed" ? "That was already done."
-            : h.status === "cancelled" ? "That one was cancelled. Ask me again if you still want it."
-            : "That request expired. Ask me again and I'll set it up fresh.";
-        }
+        out = claimed
+          ? (await executePending(claimed, { party: tapParty, inboundId: inboundWamid })).outcome
+          : why(await holdStatus(holdId));
       }
       await sendTextAndLog(from, out, { party: tapParty });
       return NextResponse.json({ ok: true });

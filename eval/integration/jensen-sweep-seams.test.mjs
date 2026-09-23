@@ -834,9 +834,10 @@ check("seam.86 the router settles only harmless cases; on WhatsApp NOTHING execu
   const r = loop.slice(loop.indexOf("export async function confirmRouter"), loop.indexOf("// Compare what was sent with what was asked."));
   const wa = r.slice(r.indexOf("// WhatsApp: NOTHING executes from typed text"));
   if (/executePending\(|claimPending\(|claimByTap\(/.test(wa)) return "the WhatsApp branch of the router can execute a held action from typed text";
-  if (!/lastOutboundCarries\(ctx\.party, open\.echo, "whatsapp"\)/.test(wa)) return "typed yes/no is intercepted even when the buttons are not the last thing he saw";
+  if (!/lastOutboundIsButtons\(ctx\.party\)/.test(wa)) return "typed yes/no is intercepted even when the buttons are not the last thing he saw";
   const portal = r.slice(0, r.indexOf("// WhatsApp: NOTHING executes"));
-  if (!/offerPending\(ctx\.party, ctx\.inboundId, "portal"\)/.test(portal)) return "portal confirmations are not bound to the portal channel";
+  if (!/findOpenHold\(ctx\.party, "portal"\)/.test(portal) || !/claimOnPortal\(open\.id, ctx\.party, ctx\.inboundId\)/.test(portal)) return "portal confirmations are not bound to the portal channel";
+  if (!/lastOutboundCarries\(ctx\.party, open\.echo, "portal"\)/.test(portal)) return "a portal 'yes' can confirm a question that is no longer on his screen";
   const routerCall = loop.indexOf("await confirmRouter({");
   const buildCall = loop.indexOf("await buildSystem(lastUser");
   if (routerCall < 0 || (buildCall > 0 && routerCall > buildCall)) return "the router does not run before the prompt build";
@@ -904,15 +905,18 @@ check("seam.91 the monitor reads wall drops through a count-only endpoint with i
   return null;
 });
 
-check("seam.92 a held action is answerable by exactly ONE reply; a later casual yes cannot fire it (review blocker A)", () => {
+check("seam.92 portal: a bare yes confirms only the question on screen; never the proposing message; one question per channel", () => {
   const pa = read("lib/concierge/pending-actions.ts");
-  if (!/export async function offerPending/.test(pa)) return "offerPending missing";
-  if (!/if \(a\.offered_to\) \{ await setValue\(r\.key, \{ \.\.\.a, status: "cancelled" \}\)/.test(pa)) return "a proposal that already had its reply is not cancelled";
-  if (!/value->>offered_to=is\.null/.test(pa)) return "binding a proposal to an inbound is not atomic";
-  if (!/if \(a\.offered_to !== inboundId\) return null/.test(pa)) return "claimPending accepts a confirmation from an inbound the question was not offered to";
-  const propose = pa.slice(pa.indexOf("export async function proposePending"), pa.indexOf("export async function offerPending"));
-  if (!/await setValue\(r\.key, \{ \.\.\.r\.value, status: "cancelled" \}\)/.test(propose)) return "proposing does not cancel older open questions (two questions could be in flight)";
-  if (!/offered_to: null,/.test(propose)) return "re-asking the identical action does not re-arm it; his next yes would cancel it (review 2, finding 2)";
+  const c = pa.slice(pa.indexOf("export async function claimOnPortal"), pa.indexOf("export async function recentlyExecutedSame"));
+  if (!c) return "claimOnPortal missing";
+  if (!/a\.proposed_inbound_id === inboundId\) return null/.test(c)) return "the proposing message can confirm its own action (self-confirm)";
+  if (!/a\.channel !== "portal"/.test(c)) return "a WhatsApp hold could be confirmed by typing on the portal";
+  if (!/value->>status=eq\.pending/.test(pa)) return "the claim is not status-guarded";
+  const propose = pa.slice(pa.indexOf("export async function proposePending"), pa.indexOf("export async function findOpenHold"));
+  if (!/openFor\(input\.party, input\.channel\)/.test(propose)) return "proposing does not scope 'one question in flight' to the channel";
+  if (!/status: "cancelled" \}\)/.test(propose)) return "proposing does not cancel older open questions";
+  const loop = read("lib/concierge/loop.ts");
+  if (!/chan === "portal" && showOnPortal/.test(loop)) return "the portal question is not kept on screen while it waits, so a later 'yes' could not safely answer it";
   return null;
 });
 
@@ -966,7 +970,7 @@ check("seam.96 'remind me' becomes a reminder that PINGS (set_reminder -> timed 
   if (!/time: input\.time \|\| "09:00"/.test(c)) return "set_reminder has no default time, so a dateless reminder would never fire";
   if (!/reconcileEventDate\(ctx, ev\)/.test(c)) return "set_reminder skips the weekday backstop";
   if (!/"create_event", "set_reminder"/.test(d)) return "set_reminder is not behind the dev write wall";
-  if (!/"set_reminder",\n  "create_entity"/.test(tools)) return "set_reminder does not back a 'reminder set' claim for the honesty rail";
+  if (!/export const COMPLETION_TOOLS = new Set\(\[\n  "set_reminder",/.test(tools)) return "set_reminder does not back a 'reminder set' claim for the honesty rail";
   const router = read("lib/concierge/router.ts");
   const cc = router.slice(router.indexOf("const CROSS_CUTTING"), router.indexOf("];", router.indexOf("const CROSS_CUTTING")));
   if (!/"set_reminder"/.test(cc)) return "set_reminder is not in every lane";
@@ -1000,7 +1004,7 @@ check("seam.98 on WhatsApp a held action runs ONLY on a tap of its own button (r
 check("seam.99 code, not the model, shows the held question: Yes/No buttons on WhatsApp, the last line on the portal", () => {
   const loop = read("lib/concierge/loop.ts");
   if (!/if \(r\.held\) held = r\.held;/.test(loop)) return "the held question is not captured from the tool result";
-  if (!/reply = reply\.split\(held\.echo\)\.join\(""\)\.trim\(\);/.test(loop)) return "a model-written copy of the question is not removed (he would be asked twice)";
+  if (!/if \(q\) reply = reply\.split\(q\)\.join\(""\)\.trim\(\);/.test(loop)) return "a model-written copy of the question is not removed (he would be asked twice)";
   if (!/return \{ held: held \?\? undefined, reply/.test(loop)) return "the held action is not returned to the webhook";
   const hook = read("app/api/whatsapp/route.ts");
   if ((hook.match(/if \(held\) await sendConfirmButtons\(/g) || []).length < 2) return "a reply path (text or voice) does not send the buttons";
@@ -1010,7 +1014,7 @@ check("seam.99 code, not the model, shows the held question: Yes/No buttons on W
   if (!/export async function sendButtonsAndLog/.test(st)) return "buttons are not sent through the logging chokepoint (Law 2)";
   const wa = read("lib/whatsapp.ts");
   const w = wa.slice(wa.indexOf("export async function sendWhatsAppInteractive"), wa.indexOf("export async function sendWhatsAppRaw("));
-  if (!/sanitizeReply\(cleaned, JENSEN_BOT_GUARDS_CONFIG\)\.dropped/.test(w)) return "buttons bypass THE WALL";
+  if (!/const g = sanitizeReply\(cleaned, JENSEN_BOT_GUARDS_CONFIG\);\s*if \(g\.dropped\)/.test(w)) return "buttons bypass THE WALL";
   if (!/passesTrainingGate/.test(w) || !/bot_muted/.test(w)) return "buttons bypass the training gate or the mute switch";
   return null;
 });
@@ -1033,6 +1037,66 @@ check("seam.101 set_reminder repeats when asked and never sets a reminder that h
   if (!/recurrence: input\.recurrence/.test(c)) return "'remind me every Monday' pings once";
   if (!/already passed/.test(c)) return "'remind me today' at 15:00 sets a 09:00 reminder that never fires";
   if (!/recurrence: str\(/.test((read("lib/concierge/tools.ts").match(/\{ name: "set_reminder"[\s\S]*?\) \},\n/) || [""])[0])) return "the model cannot pass a recurrence";
+  return null;
+});
+
+check("seam.102 a Yes button never sits under a question he did not receive; undelivered buttons are recorded and cancelled (review 4 blocker)", () => {
+  const hook = read("app/api/whatsapp/route.ts");
+  const b = hook.slice(hook.indexOf("async function sendConfirmButtons"), hook.indexOf("export async function POST("));
+  if (!/if \(!shown\.ok \|\| shown\.dropped\) return giveUp\(\);/.test(b)) return "buttons are sent after the long question was walled or failed";
+  if (!/if \(!sent\.ok\) return giveUp\(\);/.test(b)) return "a failed button send leaves the action held with no way to see it";
+  if (!/await cancelPending\(held\.id\);/.test(b)) return "giving up does not cancel the held action";
+  const st = read("lib/sendTextAndLog.ts");
+  if (!/return \{ ok: sendResult\.ok, dropped: sanitized\.dropped \}/.test(st)) return "sendTextAndLog hides that the wall replaced the message";
+  if (!/\[buttons NOT delivered\]/.test(st)) return "the transcript claims buttons were shown that never arrived";
+  const wa = read("lib/whatsapp.ts");
+  if (!/cleaned = g\.body;/.test(wa)) return "buttons carry the raw text instead of the wall-cleaned text";
+  const d = read("lib/concierge/dispatch.ts");
+  if (!/MAX_CONFIRMABLE_BODY/.test(d) || /more characters\)/.test(d)) return "an email body can be approved without being shown in full";
+  return null;
+});
+
+check("seam.103 a tap that cannot run says what actually happened (still running / failed / done / cancelled / expired)", () => {
+  const hook = read("app/api/whatsapp/route.ts");
+  const t = hook.slice(hook.indexOf("// CONFIRMATION TAP"), hook.indexOf("// OPERATOR MIRROR"));
+  for (const [needle, why] of [
+    ['"Still working on that one."', "a tap during a slow send says 'expired' and invites a duplicate"],
+    ['"That did not go through last time.', "a tap after a FAILED send says 'already done'"],
+    ['"That was already done."', "a tap on an executed button is not recognised"],
+  ]) if (!t.includes(needle)) return why;
+  const pa = read("lib/concierge/pending-actions.ts");
+  if (!/value->>status=eq\.confirmed/.test(pa.slice(pa.indexOf("export async function recentlyExecutedSame")))) return "a send that is still going out can be re-held and sent twice";
+  return null;
+});
+
+check("seam.104 the model can CANCEL a held action in any words, and can never confirm one", () => {
+  const d = read("lib/concierge/dispatch.ts");
+  const c = d.slice(d.indexOf('case "cancel_held_action"'), d.indexOf('case "set_reminder"'));
+  if (!/cancelPending\(open\.id\)/.test(c)) return "cancel_held_action does not cancel";
+  if (/executePending|claimByTap|claimOnPortal/.test(c)) return "the cancel tool can execute something";
+  const tools = read("lib/concierge/tools.ts");
+  if (!/"cancel_held_action", \/\/ backs/.test(tools)) return "'cancelled, it won't go out' would be rewritten by the honesty rail";
+  const router = read("lib/concierge/router.ts");
+  if (!/"cancel_held_action"/.test(router.slice(router.indexOf("const CROSS_CUTTING")))) return "the cancel tool is missing from some lanes";
+  return null;
+});
+
+check("seam.105 'done' never falls back to 'the most recently created' (21 Sep); a recurring event's next occurrence is not a series", () => {
+  const loop = read("lib/concierge/loop.ts");
+  const line = loop.slice(loop.indexOf("`DONE-RESOLUTION:"), loop.indexOf("`,", loop.indexOf("`DONE-RESOLUTION:")));
+  if (/Pick the most recently mentioned by name or the most recently created/.test(line)) return "the prompt still tells the model to pick the most recently created task";
+  if (!/LAST REMINDER I SENT HIM/.test(line)) return "the prompt does not anchor 'done' to the last reminder sent";
+  const hook = read("app/api/whatsapp/route.ts");
+  const h = hook.slice(hook.indexOf("async function pingedJustNow"), hook.indexOf("async function sendConfirmButtons"));
+  if (!/if \(\(ev as any\)\.recurrence\) return \{ id: ev\.id, title: ev\.title \};/.test(h)) return "a weekly reminder's next occurrence blocks 'done', sending it to the model";
+  return null;
+});
+
+check("seam.106 set_reminder never accepts a reminder that cannot ping; a passed recurring start rolls to the next one", () => {
+  const d = read("lib/concierge/dispatch.ts");
+  const c = d.slice(d.indexOf('case "set_reminder"'), d.indexOf('case "create_event"'));
+  if (!/minsNow \+ 6/.test(c)) return "a reminder under the cron's 5-minute lead is accepted and never pings";
+  if (!/if \(ev\.recurrence === "weekly"\) d\.setUTCDate\(d\.getUTCDate\(\) \+ 7\)/.test(c)) return "'every Monday' said on a Monday after 09:00 is refused instead of starting next week";
   return null;
 });
 
