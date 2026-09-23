@@ -11,10 +11,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { sendTextAndLog, sendTemplateAndLog } from "@/lib/sendTextAndLog";
 import { isInWindow } from "@/lib/whatsapp-window";
-import { reminderPlan, REMINDER_TEMPLATE, REMINDER_TEMPLATE_LANG } from "@/lib/concierge/reminder-plan.mjs";
+import { reminderPlan, REMINDER_TEMPLATE, REMINDER_TEMPLATE_LANG } from "@/lib/concierge/reminder-plan";
 import { whoIs } from "@/lib/whatsapp";
 import { dubaiToday } from "@/lib/time";
-import { sbSelect, sbUpdate, sbInsert, enc } from "@/lib/concierge/rest";
+import { sbSelect, sbUpdateReturning, sbInsert, enc } from "@/lib/concierge/rest";
 import { normalizeEventTitleKey } from "@/lib/concierge/ops";
 
 export const runtime = "nodejs";
@@ -101,15 +101,22 @@ async function handle(req: NextRequest) {
     // latch then failed, the event would re-match reminded_at=is.null every tick
     // and spam the same reminder forever. At-most-once: only send after we have
     // successfully latched; if the latch fails, skip and retry next tick (no dup).
-    const latched = await sbUpdate("events", `id=eq.${enc(ev.id)}`, { reminded_at: Date.now() })
-      .then(() => true).catch(() => false);
+    // Guarded on reminded_at=is.null so two overlapping cron runs cannot both
+    // claim (and both send) the same reminder.
+    const latched = await sbUpdateReturning("events", `id=eq.${enc(ev.id)}&reminded_at=is.null`, { reminded_at: Date.now() })
+      .then((rows) => rows.length === 1).catch(() => false);
     if (!latched) continue;
     let mode: string = plan.mode;
     for (const num of to) {
       if (plan.mode === "template") {
         const r = await sendTemplateAndLog(num, REMINDER_TEMPLATE, REMINDER_TEMPLATE_LANG, plan.params, plan.text, { force: true, party: "jensen" });
         if (r.ok) continue;
-        mode = "template-failed-text"; // no worse than before FM-21, and lands if the window is in fact open
+        // Refused while his window is closed: free text would be accepted and never
+        // delivered, so none is sent (the chokepoint recorded it and paged the
+        // developer). A wall drop still goes through sendTextAndLog so the drop is
+        // logged and paged the usual way.
+        if (!r.dropped && !win.open) { mode = "template-failed"; continue; }
+        mode = r.dropped ? "template-dropped" : "template-failed-text";
       }
       await sendTextAndLog(num, plan.mode === "template" ? plan.fallbackText : plan.text, { force: true, party: "jensen" });
     }

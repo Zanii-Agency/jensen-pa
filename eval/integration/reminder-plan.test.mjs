@@ -8,7 +8,7 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 
-import { reminderPlan, REMINDER_TEMPLATE } from "../../lib/concierge/reminder-plan.mjs";
+import { reminderPlan, reminderTitle, REMINDER_TEMPLATE } from "../../lib/concierge/reminder-plan.ts";
 
 const prateek = { title: "Meeting with Prateek", time: "19:00" };
 const withLink = { title: "Call with Waren", time: "19:00", meeting_url: "https://meet.google.com/abc-defg-hij" };
@@ -58,4 +58,30 @@ test("off-window with a link: the template can't carry it, so the text fallback 
   const p = reminderPlan(withLink, { open: false, hoursSince: 30 });
   assert.equal(p.text, "Reminder. Call with Waren at 19:00. Reply here if you need anything for it.");
   assert.match(p.fallbackText, /meet\.google\.com/);
+});
+
+// Review of PR #12: what he reads, what is logged and what "done" looks for must
+// be the same words, whatever the title looks like.
+const messy = ["Call with Waren \u2014 Q3 review", "Lunch  with Nas", "Dinner with team ", "Dinner\nwith team", null, "\u2014"];
+
+test("a title with a dash: no dash is logged or sent (Law 5), and the words match", () => {
+  const off = reminderPlan({ title: "Call with Waren \u2014 Q3 review", time: "19:00" }, { open: false, hoursSince: 30 });
+  assert.deepEqual(off.params, ["Call with Waren, Q3 review", "19:00"]);
+  assert.equal(off.text, "Reminder. Call with Waren, Q3 review at 19:00. Reply here if you need anything for it.");
+  const on = reminderPlan({ title: "Call with Waren \u2014 Q3 review", time: "19:00" }, { open: true, hoursSince: 1 });
+  assert.equal(on.text, "Reminder. Call with Waren, Q3 review at 19:00.");
+});
+
+test("his 'done' still finds the event for untidy titles, on both paths", () => {
+  for (const title of messy) for (const win of [{ open: true, hoursSince: 1 }, { open: false, hoursSince: 30 }]) {
+    const p = reminderPlan({ title, time: "13:00" }, win);
+    assert.ok(p.text.startsWith(`Reminder. ${reminderTitle(title)} at`), `${JSON.stringify(title)} ${p.mode}`);
+  }
+});
+
+test("a title that is empty or only a dash never becomes an empty template parameter", () => {
+  for (const title of [null, "", "  ", "\u2014"]) {
+    const p = reminderPlan({ title, time: "13:00" }, { open: false, hoursSince: 30 });
+    assert.equal(p.params[0], "Your event");
+  }
 });

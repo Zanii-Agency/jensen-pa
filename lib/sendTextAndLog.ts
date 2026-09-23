@@ -16,6 +16,7 @@ import { admin } from "@/lib/db";
 import { sanitizeReply } from "@/lib/bot-guards/index.js";
 import { JENSEN_BOT_GUARDS_CONFIG } from "@/lib/bot/guards-config";
 import { mirrorToChatwoot } from "@/lib/chatwoot-mirror";
+import { deliveryFailedAudit } from "@/lib/concierge/wa-delivery.mjs";
 
 // Law 10 (test-mode) branch: opts.dev === true reroutes the message to the
 // developer phone and SKIPS chat_messages + audit inserts. Test traffic never
@@ -160,13 +161,25 @@ export async function sendTemplateAndLog(
     ts: Date.now(),
   }).select("id").single();
   const rowId: number | null = (ins?.data as any)?.id ?? null;
-  const wamid = await sendWhatsAppTemplate(to, name, lang, params, { force: opts?.force });
+  mirrorToChatwoot("outgoing", to, text).catch(() => {});
+  const wamid = await sendWhatsAppTemplate(to, name, lang, params, { force: opts?.force, mirror: text });
   if (rowId != null) {
     try {
       await admin().from("chat_messages")
         .update(wamid ? { external_id: wamid } : { content: `${text}\n[template NOT sent]` })
         .eq("id", rowId);
     } catch { /* best effort */ }
+  }
+  if (!wamid) {
+    // Not silent: counted by /api/health/wall-drops, and the developer is paged.
+    try {
+      await admin().from("chat_messages").insert({
+        role: "system", channel: "audit", party: opts?.party ?? "jensen", ts: Date.now(),
+        content: deliveryFailedAudit({ wamid: "none", error: `template ${name} not sent` }, { content: text }),
+      });
+    } catch { /* best effort */ }
+    const dev = devPhone();
+    if (dev) sendWhatsAppRaw(dev, `[Dorje] template ${name} was not sent to the client. It said: ${text.slice(0, 300)}`, { force: true }).catch(() => {});
   }
   return { ok: !!wamid };
 }

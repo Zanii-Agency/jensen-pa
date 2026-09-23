@@ -19,6 +19,7 @@ import { parkLink } from "@/lib/pending-links";
 import { shouldProcess, mediaArrived } from "@/lib/brain-core/index.js";
 import { coalesceTurn, finishTurn } from "@/lib/whatsapp-coalesce";
 import { parseStatuses, shouldApplyStatus, deliveryFailedAudit } from "@/lib/concierge/wa-delivery.mjs";
+import { reminderTitle } from "@/lib/concierge/reminder-plan";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -132,7 +133,7 @@ async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
     "chat_messages",
     `select=content&party=eq.jensen&role=eq.assistant&channel=eq.whatsapp&order=ts.desc&limit=1`,
   );
-  if (!String(last?.[0]?.content || "").startsWith(`Reminder. ${ev.title} at`)) return null;
+  if (!String(last?.[0]?.content || "").startsWith(`Reminder. ${reminderTitle(ev.title)} at`)) return null;
   // A RECURRING event (weekly/monthly/yearly) gets its next occurrence created as a
   // new row the moment it fires. That row is next week's reminder, not "the rest of
   // a series still firing", so "done" closes this occurrence only (review 4, #3).
@@ -206,7 +207,8 @@ export async function POST(req: NextRequest) {
             // after his 24h window closed). Visible as an audit row, see wa-delivery.
             const { data: hit } = await admin().from("chat_messages").select("party,content").eq("external_id", s.wamid).limit(1);
             const r = Array.isArray(hit) ? hit[0] : null;
-            if (r) await admin().from("chat_messages").insert({ role: "system", channel: "audit", party: r.party, content: deliveryFailedAudit(s, r), ts: Date.now() });
+            const { data: dup } = await admin().from("chat_messages").select("id").eq("channel", "audit").like("content", `%wamid=${s.wamid} %`).limit(1);
+            if (r && !dup?.length) await admin().from("chat_messages").insert({ role: "system", channel: "audit", party: r.party, content: deliveryFailedAudit(s, r), ts: Date.now() });
           }
           const { data } = await admin()
             .from("chat_messages")
