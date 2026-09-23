@@ -4,6 +4,7 @@
 
 import { sbSelect, sbInsert, sbUpdate, sbRpc, enc } from "./rest";
 import { searchFacts, searchDocs, searchSaid, labelFact, type FoundFact } from "./memory-search";
+import { judgeSaid, mergeSaid } from "./memory-judge";
 import { claudeJSON } from "../anthropic";
 import { embed as openaiEmbed } from "../openai";
 
@@ -121,7 +122,7 @@ function rrf<T>(lists: T[][], key: (t: T) => string): T[] {
 }
 
 // said: his own past messages matching this one, dated (see memory-search.ts).
-export type Recall = { facts: string[]; docs: { title: string; text: string }[]; said: { when: string; text: string }[] };
+export type Recall = { facts: string[]; docs: { title: string; text: string }[]; said: { when: string; text: string; ts?: number }[] };
 
 export async function recall(query: string, opts?: { factK?: number; docK?: number; party?: string }): Promise<Recall> {
   const factK = opts?.factK ?? 6;
@@ -132,14 +133,18 @@ export async function recall(query: string, opts?: { factK?: number; docK?: numb
   // WHOLE message as one substring (`fact ilike *<message>*`), which matched almost
   // nothing, and the embed key has returned 401 since at least June, so memory was
   // effectively off. memory-search.ts searches the important words instead.
-  const [qe, factKwFacts, kwDocs, said] = await Promise.all([
+  const [qe, factKwFacts, kwDocs, kwSaid, judged] = await Promise.all([
     tryEmbed(q),
     factK ? searchFacts(q, 10) : Promise.resolve([] as FoundFact[]),
     docK ? searchDocs(q, 10) : Promise.resolve([] as { title: string; content: string }[]),
     // The SPEAKER's own past words: on a developer turn, Jensen's messages must not
     // be presented as things the developer said (review, finding 9).
-    searchSaid(q, opts?.party || "jensen", 3).catch(() => [] as { when: string; text: string }[]),
+    searchSaid(q, opts?.party || "jensen", 3).catch(() => [] as { when: string; text: string; ts: number }[]),
+    // By meaning (memory-judge.ts). Only for a real turn (party given), not the
+    // name lookups that also call recall().
+    opts?.party ? judgeSaid(q, opts.party, 4) : Promise.resolve(null),
   ]);
+  const said = mergeSaid(judged, kwSaid, 4);
 
   // FACTS
   const factVec: any[] = qe ? await sbRpc("match_brain_facts", { query_embedding: vec(qe), match_count: 10 }).catch(() => []) : [];
