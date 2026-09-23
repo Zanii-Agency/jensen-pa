@@ -1118,6 +1118,38 @@ check("seam.108 no untrue claim words: 'cancelled' never stands for something th
   return null;
 });
 
+check("seam.109 memory searches the IMPORTANT WORDS, never his whole message as one substring (memory was off since June)", () => {
+  const b = read("lib/concierge/brain.ts");
+  const r = b.slice(b.indexOf("export async function recall"), b.indexOf("const SALIENCE_SYS"));
+  if (/ilike\.\*\$\{enc\(q\)\}\*/.test(r)) return "recall searches for the whole message again (matches almost nothing)";
+  if (!/searchFacts\(q/.test(r) || !/searchDocs\(q/.test(r) || !/searchSaid\(q/.test(r)) return "recall does not use the keyword memory search";
+  if (!/tryEmbed\(q\)/.test(r)) return "the embedding path is gone; adding a key later would not switch smart search back on";
+  const m = read("lib/concierge/memory-search.ts");
+  if (!/ts=lt\.\$\{before\}/.test(m)) return "his own current message can match itself as a memory";
+  return null;
+});
+
+check("seam.110 the bot sees what he told it before, and the next 7 days, every turn", () => {
+  const loop = read("lib/concierge/loop.ts");
+  if (!/THINGS HE TOLD YOU BEFORE/.test(loop)) return "his own earlier words never reach the prompt";
+  if (!/COMING UP \(next 7 days/.test(loop)) return "only today's calendar is visible (the road-test miss)";
+  if (!/never call one "a default"/.test(loop)) return "the prompt does not stop the bot doubting times he gave";
+  if (/every event you mention by name in this turn MUST appear in TODAY'S CALENDAR/.test(loop)) return "the calendar wall still forbids mentioning any non-today event";
+  return null;
+});
+
+check("seam.111 the history window is his conversation, not audit rows and mail alerts", () => {
+  const ops = read("lib/concierge/ops.ts");
+  const c = ops.slice(ops.indexOf("export async function chatRecent"), ops.indexOf("export async function readOwnerChats"));
+  if (!/role=in\.\(user,assistant\)/.test(c)) return "audit/system rows still eat the history window";
+  if (!/AUTOMATED_PUSH\.some/.test(c)) return "old mail alerts and briefs still fill the window";
+  if (!/i >= tailFrom/.test(c)) return "the alert he is replying to right now would be dropped too";
+  const pre = ops.slice(ops.indexOf("const AUTOMATED_PUSH"), ops.indexOf("export async function chatRecent"));
+  if (/Reminder/.test(pre)) return "reminders are filtered out, so a bare 'done' loses its anchor";
+  if (!/chatRecent\(party, 20\)/.test(read("app/api/whatsapp/route.ts"))) return "the webhook still passes only 12 messages";
+  return null;
+});
+
 check("seam.63 emailed meeting links reach the event row (meetingUrl threads inbox->route->addEmailEvent->addEvent) (KT #342)", () => {
   // addEvent must actually WRITE meeting_url (it silently omitted it before)
   const db = read("lib/db.ts");
@@ -1254,11 +1286,15 @@ check("seam.71 doc search is Claude-powered (no OpenAI embeddings) — reads the
 });
 
 check("seam.72 recall() keyword-searches the docs TABLE (title or content) so content-only docs (no chunks, embed down) still ground the brain — FM-42 / KT #349", () => {
+  // Since 2026-09-23 this lives in memory-search.ts searchDocs, and searches his
+  // important WORDS instead of the whole message (which matched almost nothing).
+  const m = read("lib/concierge/memory-search.ts");
+  const d = m.slice(m.indexOf("export async function searchDocs"));
+  if (!/"docs",\s*`or=\(\$\{anyOf\("title", words\)\},\$\{anyOf\("content", words\)\}\)/.test(d)) return "the docs table is not keyword-searched on BOTH title and content";
   const br = read("lib/concierge/brain.ts");
   const rc = br.slice(br.indexOf("export async function recall"));
-  if (!/sbSelect<any>\("docs",\s*`or=\(title\.ilike/.test(rc)) return "recall does not keyword-search the docs table by title";
-  if (!/content\.ilike/.test(rc)) return "recall docs-table fallback does not search content";
-  if (!/rrf<any>\(\[docVecNorm, docKw, docTbl\]/.test(rc)) return "docTbl not fused into the doc ranking";
+  if (!/searchDocs\(q, 10\)/.test(rc)) return "recall does not call the docs-table search";
+  if (!/rrf<any>\(\[docVecNorm, docKw, docTbl\]/.test(rc)) return "keyword docs are not fused into the doc ranking";
   return null;
 });
 
