@@ -187,7 +187,7 @@ export async function dayLog(date: string) {
   if (Number.isNaN(start)) return { date: dateISO, error: "invalid date, expected YYYY-MM-DD" };
   const end = start + 86_400_000;
   const [msgs, events, tasks] = await Promise.all([
-    sbSelect<any>("chat_messages", `party=eq.jensen&ts=gte.${start}&ts=lt.${end}&order=ts.asc&select=role,content,ts&limit=200`).catch(() => []),
+    sbSelect<any>("chat_messages", `party=eq.jensen&role=in.(user,assistant)&ts=gte.${start}&ts=lt.${end}&order=ts.asc&select=role,content,ts&limit=200`).catch(() => []),
     sbSelect<any>("events", `date=eq.${enc(dateISO)}&order=time.asc&select=time,title`).catch(() => []),
     sbSelect<any>("tasks", `created_at=gte.${start}&created_at=lt.${end}&order=created_at.asc&select=title,quadrant`).catch(() => []),
   ]);
@@ -511,7 +511,7 @@ export async function chatRecent(party = "jensen", limit = 12): Promise<{ role: 
 }
 // Admin-only: read Jensen's recent conversation (development access, one-way).
 export async function readOwnerChats(limit = 40): Promise<{ role: string; content: string; channel: string; ts: number }[]> {
-  const rows = await sbSelect<any>("chat_messages", `party=eq.jensen&select=role,content,channel,ts&order=ts.desc&limit=${limit}`);
+  const rows = await sbSelect<any>("chat_messages", `party=eq.jensen&content=not.like.memory_judge_failed*&select=role,content,channel,ts&order=ts.desc&limit=${limit}`);
   return rows.reverse();
 }
 

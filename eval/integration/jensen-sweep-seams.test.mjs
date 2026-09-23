@@ -1261,11 +1261,13 @@ check("seam.113 memory judge: meaning-based recall on real turns, ids only, fail
   if (!brain.includes("opts?.party ? judgeSaid(q, opts.party, 4)")) return "recall() no longer asks the judge on a real turn (or asks it on name lookups)";
   if (!brain.includes("mergeSaid(judged, kwSaid, 4)")) return "judge picks and keyword hits are no longer merged";
   if (!judge.includes("pool.his.has(id)")) return "judge output is not restricted to ids of his lines that it was shown";
-  if (!judge.includes("keyword.filter((m) => m.ts < judged.from || m.ts > judged.to)")) return "keyword hits: turned-down lines refill, or fresh ones outside the judge's range are lost";
+  if (!judge.includes("keyword.filter((m) => m.ts > judged.to)") || !judge.includes("keyword.filter((m) => m.ts < judged.from)")) return "keyword hits: turned-down lines refill, or fresh ones outside the judge's range are lost";
   if (!judge.includes('stop_reason !== "end_turn"')) return "a refused or cut-off judge reply reads as 'nothing relevant'";
   if (!judge.includes("memory_judge_failed:") || !judge.includes('noteFailure(party, "timeout")')) return "judge failures are silent again";
   if (/I already paid him|they moved it, now 11/.test(judge)) return "the judge prompt contains eval answers";
-  if (!judge.includes("picks: ids.map((id) => pickedLine(pool, id))")) return "judge picks are shown without the bot's answer at the time";
+  if (!judge.includes("[...fresh, ...judged.picks, ...older]")) return "his newest keyword hits can be cut by older judge picks";
+  if (/my reply then/.test(judge + read("lib/concierge/loop.ts"))) return "the bot's old words are passed on as memory again";
+  if (!/A question or request of his .{0,60}is not a change unless a later line or his calendar shows it happened/.test(read("lib/concierge/loop.ts"))) return "a declined request can read as a change (THINGS HE SAID rule missing)";
   if (!/api\.anthropic\.com/.test(judge) || /openai/i.test(judge)) return "the judge must use the vetted Anthropic endpoint only (Law 3)";
   return null;
 });

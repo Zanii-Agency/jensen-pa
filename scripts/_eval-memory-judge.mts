@@ -12,7 +12,7 @@
 // the answers appear in the judge's prompt.
 for (const k of Object.keys(process.env)) { const v = process.env[k]; if (v && /\\n$/.test(v)) process.env[k] = v.replace(/\\n$/, "").replace(/^"|"$/g, ""); }
 const { sbSelect } = await import("../lib/concierge/rest");
-const { buildPool, judgeIds, mergeSaid, pickedLine } = await import("../lib/concierge/memory-judge");
+const { buildPool, judgeIds, mergeSaid } = await import("../lib/concierge/memory-judge");
 const { memoryKeywords, pickSaid } = await import("../lib/concierge/memory-search");
 
 const all: any[] = await sbSelect("chat_messages", "party=eq.jensen&role=in.(user,assistant)&select=id,role,ts,content&order=ts.desc&limit=1500");
@@ -49,10 +49,11 @@ const CASES: { q: string; need: number[]; never?: number[]; empty?: boolean }[] 
   { q: "is the Nimiri meeting still at 2?", need: [4877] },                  // older than the judge's range: keyword's job
   { q: "what's a good gift for a 5 year old?", need: [], empty: true },
   { q: "can you move my 3pm today to 4pm?", need: [], never: [4837] },       // shares "3pm" with an old, unrelated meeting
-  { q: "what time is lunch with Kobe?", need: [] },                          // a declined request: see the check below
+  { q: "what time is lunch with Kobe?", need: [] },                          // a declined request: counted below, not scored
 ];
-// If the declined request is shown, its outcome must come with it.
-const outcomeShown = (text: string) => !/move the Kobe lunch/.test(text) || /does not work/.test(text);
+// Recall may show the declined Kobe request; it is defended by the main prompt
+// ("a request is not a change unless a later line or his calendar shows it"), not
+// by recall. Counted so the rate stays visible.
 
 const byTs = new Map(corpus.map((r) => [Number(r.ts), r.id]));
 const said = (r: any) => ({ when: "", text: r.content, ts: Number(r.ts) });
@@ -71,19 +72,19 @@ const REPEAT = Number(process.env.EVAL_REPEAT || 2);
 if (process.env.EVAL_ONLY) CASES.splice(0, CASES.length, ...CASES.filter((c) => process.env.EVAL_ONLY!.split("|").some((q) => c.q.startsWith(q))));
 for (const spec of (process.env.EVAL_RUNS || "claude-sonnet-5:nothink").split(",")) {
   const [model, mode] = spec.split(":"); const think = mode !== "nothink";
-  let pass = 0; const ms: number[] = []; const misses: string[] = [];
+  let pass = 0, kobeShown = 0; const ms: number[] = []; const misses: string[] = [];
   for (const c of CASES) for (let run = 0; run < REPEAT; run++) {
     const t = Date.now();
     let picks: number[] = [], failed = false;
     try { picks = await judgeIds(c.q, pool, model, 4, think); } catch (e: any) { failed = true; misses.push(`${c.q} -> judge failed (${e?.message}), keyword only`); }
     ms.push(Date.now() - t);
-    const judged = failed ? null : { picks: picks.map((id) => pickedLine(pool, id)), from: poolFrom, to: poolTo };
-    const merged = mergeSaid(judged, keywordFor(c.q), 4);
-    const ids = idsOf(merged);
-    const ok = score(c, ids) && merged.every((m) => outcomeShown(m.text));
-    if (ok) pass++; else misses.push(`${c.q} -> judge [${picks.join(",")}], merged [${ids.join(",")}]${merged.some((m) => !outcomeShown(m.text)) ? " (request shown without its outcome)" : ""}`);
+    const judged = failed ? null : { picks: picks.map((id) => said(pool.his.get(id)!)), from: poolFrom, to: poolTo };
+    const ids = idsOf(mergeSaid(judged, keywordFor(c.q), 4));
+    if (ids.includes(9000011)) kobeShown++;
+    if (score(c, ids)) pass++; else misses.push(`${c.q} -> judge [${picks.join(",")}], merged [${ids.join(",")}]`);
   }
   ms.sort((a, b) => a - b);
   console.log(`\njudge + keyword, ${spec}: ${pass}/${CASES.length * REPEAT} right, judge median ${ms[Math.floor(ms.length / 2)]}ms, slowest ${ms[ms.length - 1]}ms`);
   for (const m of [...new Set(misses)]) console.log(`   miss: ${m}`);
+  console.log(`   declined Kobe request shown in ${kobeShown}/${REPEAT} runs (handled by the main prompt rule)`);
 }

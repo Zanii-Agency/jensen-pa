@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 
-import { buildPool, judgeIds, mergeSaid, pickedLine } from "../../lib/concierge/memory-judge.ts";
+import { buildPool, judgeIds, mergeSaid } from "../../lib/concierge/memory-judge.ts";
 import { memoryKeywords } from "../../lib/concierge/memory-search.ts";
 
 const day = 864e5, t0 = Date.parse("2026-09-16T07:00:00Z");
@@ -98,19 +98,24 @@ test("a correction he made in the last few messages keeps its date (portal and W
   assert.deepEqual(out.map((x) => x.text), ["dentist moved to 11", "Dentist Monday at 9:30"]);
 });
 
-test("a picked line comes with what the bot answered then, so a declined request is not read as a change", () => {
-  // Review of PR #13, finding 7: "can we move the Kobe lunch to 2pm?" alone made the
-  // main model's "newest wins" rule state 2pm, though the answer was no.
+test("four judge picks never push out a correction from his newest messages", () => {
+  // Review 2 of PR #13: picks first then a cut to 4 dropped the fresh "now 11".
+  const m = (ts, text) => ({ when: String(ts), text, ts });
+  const picks = [m(30, "road test 9:20"), m(32, "road test reminder"), m(34, "road test day before"), m(36, "road test same day")];
+  const out = mergeSaid({ picks, from: 25, to: 45 }, [m(60, "they moved the road test, now 11")], 4);
+  assert.equal(out[0].text, "they moved the road test, now 11");
+  assert.equal(out.length, 4);
+});
+
+test("only his own words are passed on, never the bot's old claims", () => {
+  // Review 2 of PR #13: an attached "(my reply then: Done, invoice sent)" turned the
+  // bot's old, possibly false, claims into memory. The pool keeps bot lines as
+  // context for the judge only.
   const t = Date.parse("2026-09-10T08:00:00Z");
   const pool = buildPool([
-    { id: 21, role: "user", ts: t, content: "can we move the Kobe lunch to 2pm?" },
-    { id: 22, role: "assistant", ts: t + 60e3, content: "Kobe's office says 2pm does not work for them, so lunch stays at 13:00." },
-    { id: 23, role: "user", ts: t + 3600e3, content: "ok" },
-    { id: 24, role: "user", ts: t + 2 * 3600e3, content: "sent the deck" },
-    { id: 25, role: "assistant", ts: t + 5 * 3600e3, content: "Much later, unrelated." },
+    { id: 21, role: "user", ts: t, content: "send Marisa the invoice" },
+    { id: 22, role: "assistant", ts: t + 60e3, content: "Done, invoice sent to Marisa." },
   ]);
-  assert.match(pickedLine(pool, 21).text, /^can we move the Kobe lunch to 2pm\? \(my reply then: Kobe's office says 2pm does not work/);
-  // No bot answer after it, or only one hours later: nothing is attached.
-  assert.equal(pickedLine(pool, 23).text, "ok");
-  assert.equal(pickedLine(pool, 24).text, "sent the deck");
+  assert.deepEqual(Object.keys(pool).sort(), ["his", "text"]);
+  assert.equal(pool.his.get(21).content, "send Marisa the invoice");
 });
