@@ -1,23 +1,27 @@
 // ADR-0002 Phase 1 — durable confirm layer (Class C1: model self-confirm).
 //
-// The gate writes a PROPOSED action here; a DETERMINISTIC confirm-router (not
-// the model) executes it only when a DISTINCT user inbound confirms.
+// A destructive tool call is not executed; it is HELD here as a proposal with a
+// code-written question. It becomes executable only in the ONE turn that
+// immediately follows it, and only via a distinct later inbound.
 //
 // STORAGE: the existing `kv` table, not a dedicated `pending_actions` table.
 // ADR-0002 specified its own table, but nobody who operates this bot has DDL
 // access to Jensen's Supabase project (checked 2026-09-23: no DB URL, no token
 // linked to the project, no SQL-exec RPC). `kv` already exists and the service
-// key already writes it (prefs, goals and the legal blueprint live there), so the
-// confirm layer needs zero schema changes to go live.
+// key already writes it. One row per proposal, key `pending_action:<party>:<id>`.
 //
-// One row per proposal: key `pending_action:<party>:<id>`, value = the action.
-// The two properties the ADR needs still hold, both proven live on 2026-09-23:
-//   - dedupe of identical open proposals: looked up by value->>args_hash
-//   - atomic claim: a PATCH filtered on value->>status=pending returns the row
-//     only to the caller whose UPDATE matched; two concurrent claims -> one wins
+// THE RULES THIS FILE ENFORCES (each one closes a real way to act on the wrong thing):
+//  1. One question in flight per party. Proposing cancels any older open one.
+//  2. A proposal is answerable by exactly ONE inbound: the first one after it.
+//     offerPending() binds it to that inbound; the next inbound after that
+//     cancels it. So a casual "yes" to some LATER question can never fire an old
+//     delete. (Adversarial review 2026-09-23, blocker A.)
+//  3. The proposing inbound can never confirm its own proposal (Class C1).
+//  4. The claim is an atomic, status-guarded PATCH: two racing confirmations,
+//     exactly one executes. Proven live 2026-09-23.
 //
-// FAIL-SAFE BY CONSTRUCTION: every function catches and returns null / no-op,
-// so a storage fault degrades to the gate's previous behaviour, never worse.
+// FAIL-SAFE: every function catches and returns null / no-op. The gate treats a
+// null proposal as "could not hold it" and REFUSES (fails closed).
 import { sbSelect, sbInsert, sbUpdate, sbUpdateReturning, sbDelete, enc } from "./rest";
 
 export type PendingStatus = "pending" | "confirmed" | "executed" | "expired" | "cancelled";
@@ -27,26 +31,29 @@ export type PendingAction = {
   tool: string;
   args: any;
   args_hash: string;
+  echo: string;                        // the exact question, written by code from the real rows
+  proposed_text: string;               // the owner message that asked for it (for the name-mismatch wall)
   proposed_inbound_id: string | null;
+  offered_to: string | null;           // the single inbound allowed to answer it
   status: PendingStatus;
   confirm_inbound_id: string | null;
   result: any;
   error: string | null;
   created_at: string;
   expires_at: string;
+  executed_at?: string;
 };
 
-const TTL_MS = 30 * 60_000;        // an unconfirmed proposal dies after 30 minutes
-const RETAIN_MS = 24 * 3_600_000;  // finished/expired rows are swept after a day
+const TTL_MS = 30 * 60_000;
+const RETAIN_MS = 24 * 3_600_000;
 const PREFIX = "pending_action:";
 
 const keyFor = (party: string, id: string) => `${PREFIX}${party}:${id}`;
 const partyLike = (party: string) => `key=like.${enc(`${PREFIX}${party}:*`)}`;
+const byId = (id: string) => `key=like.${enc(`${PREFIX}*:${id}`)}`;
 const STATUS_PENDING = `value->>status=eq.pending`;
 const isLive = (a: PendingAction) => !a.expires_at || new Date(a.expires_at).getTime() >= Date.now();
 
-// Stable idempotency key over (tool, sorted args) so logically-identical
-// proposals collide instead of stacking up.
 export function argsHash(tool: string, args: any): string {
   return `${tool}:${djb2(stableStringify(args ?? {}))}`;
 }
@@ -61,21 +68,34 @@ function djb2(s: string): string {
   return (h >>> 0).toString(36);
 }
 
-// Propose: write a pending action keyed to the proposing inbound. Returns it, or
-// null on any storage fault. An identical proposal that is still open is returned
-// as-is, so asking twice never creates two things to confirm.
+async function openFor(party: string): Promise<{ key: string; value: PendingAction }[]> {
+  return sbSelect<{ key: string; value: PendingAction }>(
+    "kv",
+    `select=key,value&${partyLike(party)}&${STATUS_PENDING}&order=updated_at.desc&limit=10`,
+  );
+}
+
+async function setValue(key: string, value: PendingAction): Promise<void> {
+  await sbUpdate("kv", `key=eq.${enc(key)}`, { value, updated_at: Date.now() });
+}
+
+// Hold a destructive action. Returns it, or null on any storage fault (the gate
+// then refuses). An identical still-open proposal is returned as-is; any OTHER
+// open proposal for this party is cancelled, so only one question is ever live.
 export async function proposePending(input: {
-  party: string; tool: string; args: any; proposedInboundId?: string | null;
+  party: string; tool: string; args: any; echo: string; proposedText: string;
+  proposedInboundId?: string | null;
 }): Promise<PendingAction | null> {
   const hash = argsHash(input.tool, input.args);
   try {
     sweep(input.party).catch(() => {});
-    const dup = await sbSelect<{ value: PendingAction }>(
-      "kv",
-      `select=value&${partyLike(input.party)}&${STATUS_PENDING}&value->>args_hash=eq.${enc(hash)}&limit=1`,
-    );
-    const existing = dup?.[0]?.value;
-    if (existing && isLive(existing)) return existing;
+    const open = await openFor(input.party);
+    let same: PendingAction | null = null;
+    for (const r of open) {
+      if (r.value.args_hash === hash && isLive(r.value)) { same = r.value; continue; }
+      await setValue(r.key, { ...r.value, status: "cancelled" });
+    }
+    if (same) return same;
 
     const nowMs = Date.now();
     const action: PendingAction = {
@@ -84,7 +104,10 @@ export async function proposePending(input: {
       tool: input.tool,
       args: input.args ?? {},
       args_hash: hash,
+      echo: input.echo,
+      proposed_text: input.proposedText,
       proposed_inbound_id: input.proposedInboundId ?? null,
+      offered_to: null,
       status: "pending",
       confirm_inbound_id: null,
       result: null,
@@ -99,40 +122,50 @@ export async function proposePending(input: {
   }
 }
 
-// The most recent still-open, non-expired proposal for a party, or null.
-export async function findOpenPending(party: string): Promise<PendingAction | null> {
+// Called once at the start of every turn. Returns the proposal THIS inbound may
+// answer, or null. Binds an unoffered proposal to this inbound; cancels any
+// proposal that already had its one reply (rule 2); never offers a proposal to
+// the inbound that created it (rule 3).
+export async function offerPending(party: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
+  if (!inboundId) return null;
   try {
-    const rows = await sbSelect<{ value: PendingAction }>(
-      "kv",
-      `select=value&${partyLike(party)}&${STATUS_PENDING}&order=updated_at.desc&limit=5`,
-    );
-    return rows.map((r) => r.value).find(isLive) ?? null;
+    const open = await openFor(party);
+    let answerable: PendingAction | null = null;
+    for (const r of open) {
+      const a = r.value;
+      if (!isLive(a)) { await setValue(r.key, { ...a, status: "expired" }); continue; }
+      if (a.proposed_inbound_id === inboundId) continue;         // made this very turn
+      if (a.offered_to === inboundId) { answerable ??= a; continue; } // retry of the same turn
+      if (a.offered_to) { await setValue(r.key, { ...a, status: "cancelled" }); continue; } // had its reply
+      const bound: PendingAction = { ...a, offered_to: inboundId };
+      const won = await sbUpdateReturning<{ value: PendingAction }>(
+        "kv",
+        `key=eq.${enc(r.key)}&${STATUS_PENDING}&value->>offered_to=is.null`,
+        { value: bound, updated_at: Date.now() },
+      );
+      if (won.length === 1) answerable ??= won[0].value;
+    }
+    return answerable;
   } catch {
     return null;
   }
 }
 
-// Confirm + claim, called by the deterministic confirm-router. The load-bearing
-// invariant (kills same-turn self-confirm): a confirm whose inbound id EQUALS the
-// proposing inbound id is refused. The claim itself is a status=pending-guarded
-// PATCH; only the caller whose UPDATE matched gets the row back, so a concurrent
-// or replayed confirmation can never execute the action twice.
-export async function confirmAndClaim(id: string, confirmInboundId: string | null): Promise<PendingAction | null> {
+// Claim for execution. Only the inbound the proposal was offered to can claim
+// it, never the proposing one, and only once.
+export async function claimPending(id: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
+  if (!inboundId) return null;
   try {
-    const rows = await sbSelect<{ key: string; value: PendingAction }>(
-      "kv",
-      `select=key,value&key=like.${enc(`${PREFIX}*:${id}`)}&limit=1`,
-    );
+    const rows = await sbSelect<{ key: string; value: PendingAction }>("kv", `select=key,value&${byId(id)}&limit=1`);
     const row = rows?.[0];
     const a = row?.value;
     if (!row || !a || a.status !== "pending" || !isLive(a)) return null;
-    if (confirmInboundId != null && a.proposed_inbound_id != null && confirmInboundId === a.proposed_inbound_id) {
-      return null; // SELF-CONFIRM: the same inbound proposed and confirmed — not a real user confirmation.
-    }
-    const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: confirmInboundId ?? null };
+    if (a.offered_to !== inboundId) return null;                  // not this turn's question
+    if (a.proposed_inbound_id === inboundId) return null;         // SELF-CONFIRM: same inbound proposed and confirmed
+    const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: inboundId };
     const won = await sbUpdateReturning<{ value: PendingAction }>(
       "kv",
-      `key=eq.${enc(row.key)}&${STATUS_PENDING}`,
+      `key=eq.${enc(row.key)}&${STATUS_PENDING}&value->>offered_to=eq.${enc(inboundId)}`,
       { value: claimed, updated_at: Date.now() },
     );
     return won.length === 1 ? won[0].value : null;
@@ -141,36 +174,31 @@ export async function confirmAndClaim(id: string, confirmInboundId: string | nul
   }
 }
 
-// Record the execution outcome after the router runs the tool.
 export async function markExecuted(id: string, outcome: { ok: boolean; result?: any; error?: string }): Promise<void> {
-  await patchAction(id, (a) => ({
+  await patchById(id, (a) => ({
     ...a,
     status: "executed",
+    executed_at: new Date().toISOString(),
     result: outcome.ok ? (outcome.result ?? null) : null,
     error: outcome.ok ? null : (outcome.error ?? "failed"),
   }));
 }
 
-// Retire an open proposal (the user said no), so a later unrelated "yes" can
-// never resurrect it.
 export async function cancelPending(id: string): Promise<void> {
-  await patchAction(id, (a) => (a.status === "pending" ? { ...a, status: "cancelled" } : a));
+  await patchById(id, (a) => (a.status === "pending" ? { ...a, status: "cancelled" } : a));
 }
 
-async function patchAction(id: string, next: (a: PendingAction) => PendingAction): Promise<void> {
+async function patchById(id: string, next: (a: PendingAction) => PendingAction): Promise<void> {
   try {
-    const rows = await sbSelect<{ key: string; value: PendingAction }>(
-      "kv",
-      `select=key,value&key=like.${enc(`${PREFIX}*:${id}`)}&limit=1`,
-    );
+    const rows = await sbSelect<{ key: string; value: PendingAction }>("kv", `select=key,value&${byId(id)}&limit=1`);
     const row = rows?.[0];
-    if (!row?.value) return;
-    await sbUpdate("kv", `key=eq.${enc(row.key)}`, { value: next(row.value), updated_at: Date.now() });
-  } catch { /* fail-safe: bookkeeping never blocks a reply */ }
+    if (row?.value) await setValue(row.key, next(row.value));
+  } catch { /* bookkeeping never blocks a reply */ }
 }
 
-// kv is shared with prefs/goals, so keep this layer from growing unbounded: any
-// proposal row untouched for a day is finished business. Best-effort.
+// kv is shared with prefs/goals; a proposal row untouched for a day is finished
+// business. The durable record of what was executed is the audit row the
+// executor writes to chat_messages, so sweeping here loses no history.
 async function sweep(party: string): Promise<void> {
   await sbDelete("kv", `${partyLike(party)}&updated_at=lt.${Date.now() - RETAIN_MS}`);
 }

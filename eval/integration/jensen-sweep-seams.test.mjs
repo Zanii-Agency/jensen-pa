@@ -421,13 +421,13 @@ check("seam.21 DONE-resolution route is owner-only post-unlock, sweep-permitted 
 // DOCTRINE LAW 8 SEAM — destructive-tool confirmation gate
 // ============================================================================
 
-check("seam.22 dispatch.ts has destructiveGate intercepting before switch", () => {
+check("seam.22 runAction runs destructiveGate BEFORE its tool switch", () => {
   const src = read("lib/concierge/dispatch.ts");
-  if (!/destructiveGate\(/.test(src)) return "destructiveGate function not present";
   if (!/const DESTRUCTIVE = new Set\(/.test(src)) return "DESTRUCTIVE set not defined";
-  // Gate must be called BEFORE the switch in runAction
-  const gateCallIdx = src.indexOf("destructiveGate(name");
-  const switchIdx = src.indexOf("switch (name)");
+  // Scope to runAction itself: describeProposal has its own switch earlier in the file.
+  const ra = src.slice(src.indexOf("export async function runAction("));
+  const gateCallIdx = ra.indexOf("await destructiveGate(name");
+  const switchIdx = ra.indexOf("switch (name)");
   if (gateCallIdx === -1) return "destructiveGate not called in runAction";
   if (switchIdx === -1) return "switch(name) not found in runAction";
   if (gateCallIdx > switchIdx) return "destructiveGate called AFTER switch (action would execute before refusal)";
@@ -447,16 +447,16 @@ check("seam.23 DESTRUCTIVE set covers all delete_*, reply_email, call_owner, for
   return null;
 });
 
-check("seam.24 destructiveGate confirms on the OWNER'S reply, never a model-set confirm (C1 fix)", () => {
+check("seam.24 nothing in the model's input or the owner's WORDS can release a destructive action; only a claimed proposal can (C1 + review blocker C)", () => {
   const src = read("lib/concierge/dispatch.ts");
-  const fnMatch = src.match(/function destructiveGate\([^)]*\)[\s\S]*?\n\}/);
-  if (!fnMatch) return "destructiveGate function body not parseable";
-  const body = fnMatch[0];
-  // The C1 hole was `input?.confirm === true` (model self-confirms). It must be GONE.
-  if (/input\?\.confirm\s*===\s*true/.test(body)) return "C1 STILL OPEN: model-supplied confirm:true is trusted (self-gatable)";
-  // The gate must key off the owner's actual inbound being an affirmation.
-  if (!/isConfirmation\(lastUser\)/.test(body)) return "gate does not validate the owner's real confirmation reply";
-  if (!/_confirmed === true/.test(body)) return "server-set _confirmed path missing";
+  const gate = src.slice(src.indexOf("async function destructiveGate("), src.indexOf("type Proposal ="));
+  if (!gate) return "destructiveGate not found";
+  if (/input\?\.(_confirmed|confirm|confirmed)/.test(gate)) return "the gate reads a confirm flag from the model's input (self-confirm / injection reopened)";
+  if (/isConfirmation\(|classifyReply\(/.test(gate)) return "the gate releases on words in the last message again (that is what confirmed 'Don't do it')";
+  if (!/ctx\?\.confirmedPendingId/.test(gate)) return "the only release path (ctx.confirmedPendingId from executePending) is missing";
+  if (!/NOT HELD/.test(gate)) return "the gate no longer FAILS CLOSED when it cannot hold the action";
+  const ra = src.slice(src.indexOf("export async function runAction("));
+  if (!/const input = stripConfirmFlags\(rawInput\)/.test(ra)) return "runAction does not strip confirm flags from model input before anything reads it";
   return null;
 });
 
@@ -811,44 +811,51 @@ check("seam.84 plaintext_credential does NOT eat meeting invites: Zoom ?pwd= + T
   return null;
 });
 
-check("seam.85 destructive gate PROPOSES a durable pending row, never a bare refusal, and forbids claiming it is done (ADR-0002 Phase 1 / the 16-Sep DJ incident)", () => {
+check("seam.85 the gate HOLDS with a question written by CODE from the real rows, and the held args are exactly those rows (review blocker B)", () => {
   const src = read("lib/concierge/dispatch.ts");
-  if (!/proposePending\(/.test(src)) return "gate does not write a pending_actions row (the old refuse-only gate is back)";
-  const gate = src.slice(src.indexOf("async function destructiveGate"), src.indexOf("function sanitizeArgs"));
-  if (!gate) return "destructiveGate not found or no longer async";
-  if (!/PROPOSED, NOT DONE/.test(gate)) return "the gate's message does not tell the model the action is only PROPOSED";
-  if (!/MUST NOT say it is done/.test(gate)) return "the gate does not forbid claiming completion (this is exactly what produced 'Cleared. All DJ payment reminders wiped.')";
-  // Self-confirm (Class C1) must stay dead: the model's own flag is never honoured.
-  if (/input\?\.confirm === true/.test(gate)) return "the model's own `confirm` flag is honoured again (Class C1 self-confirm reopened)";
-  if (!/_confirmed === true/.test(gate)) return "the server-set _confirmed escape hatch is missing (the router could not execute)";
-  // Fail-safe: no table -> previous behaviour, never worse.
-  if (!/if \(!pending\)/.test(gate)) return "no fail-safe branch for an absent pending_actions table";
+  const gate = src.slice(src.indexOf("async function destructiveGate("), src.indexOf("type Proposal ="));
+  if (!/describeProposal\(name, input\)/.test(gate)) return "the question is not built by describeProposal";
+  if (!/args: d\.args/.test(gate)) return "the held args are not the args describeProposal resolved (echo and execution can drift)";
+  if (!/echo: d\.echo/.test(gate)) return "the held question is not the code-written echo";
+  if (!/word for word/.test(gate)) return "the model is not told to relay the question verbatim";
+  if (!/Do not say it is done/.test(gate)) return "the gate does not forbid claiming completion";
+  const dp = src.slice(src.indexOf("export async function describeProposal"), src.indexOf("export async function executePending"));
+  if (!/const args = \{ ids: rows\.map/.test(dp)) return "delete_event holds the ids ASKED for instead of the rows that exist";
+  if (!/nothing:/.test(dp)) return "a proposal for rows that no longer exist is not refused";
+  if (/4 remaining DJ/.test(src)) return "a hard-coded example count remains; the model will repeat it for the wrong series";
   return null;
 });
 
-check("seam.86 a confirmation is resolved by CODE before the model, and only a DISTINCT inbound can confirm (kills same-turn self-confirm)", () => {
+check("seam.86 a bare yes/no is settled by CODE before the prompt is built; anything else becomes an OPEN QUESTION for the model", () => {
   const loop = read("lib/concierge/loop.ts");
   if (!/export async function confirmRouter/.test(loop)) return "confirmRouter missing";
-  if (!/confirmAndClaim\(/.test(loop)) return "router does not claim the row via confirmAndClaim (no distinct-inbound guard)";
-  if (!/cancelPending\(/.test(loop)) return "router never retires a declined proposal; a stale pending could be resurrected by a later unrelated yes";
-  // The router must run BEFORE the model gets the turn, or the model is still the decider.
+  if (!/offerPending\(ctx\.party, ctx\.inboundId\)/.test(loop)) return "router does not bind the held action to THIS inbound";
+  if (!/classifyReply\(ctx\.lastUser\)/.test(loop)) return "router does not use the strict bare-reply classifier";
+  if (!/claimPending\(open\.id, ctx\.inboundId\)/.test(loop)) return "router does not claim through claimPending";
   const routerCall = loop.indexOf("await confirmRouter({");
-  const modelCall = loop.indexOf("const route = routeDomain(lastUser)");
+  const buildCall = loop.indexOf("await buildSystem(lastUser");
   if (routerCall < 0) return "confirmRouter is never called";
-  if (modelCall > 0 && routerCall > modelCall) return "confirmRouter runs AFTER the model routing; it must resolve the turn first";
-  // The distinct-inbound invariant itself lives in the data module.
-  const pa = read("lib/concierge/pending-actions.ts");
-  if (!/SELF-CONFIRM/.test(pa)) return "confirmAndClaim no longer refuses a confirm from the proposing inbound";
-  // And the id has to actually reach the loop from the webhook, or nothing can be distinct.
+  if (buildCall > 0 && routerCall > buildCall) return "confirmRouter runs AFTER the prompt build; it must settle the turn first";
+  if (!/OPEN QUESTION \(a held action/.test(loop)) return "an unsettled held action is never shown to the model";
   const hook = read("app/api/whatsapp/route.ts");
-  if (!/inboundId: inboundWamid/.test(hook)) return "the webhook does not thread inboundWamid into runConcierge; every confirm would look identity-less";
+  if (!/inboundId: inboundWamid/.test(hook)) return "the webhook does not thread inboundWamid; no confirmation could be proven distinct";
+  const portal = read("app/api/chat/route.ts");
+  if (!/inboundId: `portal:/.test(portal)) return "portal turns carry no inbound id; nothing proposed on the portal could ever be confirmed there";
   return null;
 });
 
-check("seam.87 no tool advertises the confirm:true protocol the gate ignores (never print an instruction the parser does not accept)", () => {
+check("seam.87 no DESTRUCTIVE tool advertises a confirm flag (never print an instruction the parser does not accept)", () => {
   const tools = read("lib/concierge/tools.ts");
-  if (/confirm:true/.test(tools)) return "a tool description still tells the model to 'call again with confirm:true', which the gate ignores -> the model believes the action ran";
-  if (/confirm: bool\(/.test(tools)) return "an inert `confirm` input remains on a tool schema; the model will set it and infer it did something";
+  const dispatch = read("lib/concierge/dispatch.ts");
+  const set = dispatch.slice(dispatch.indexOf("const DESTRUCTIVE = new Set(["), dispatch.indexOf("]);", dispatch.indexOf("const DESTRUCTIVE = new Set([")));
+  const names = [...set.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+  for (const n of names) {
+    const def = (tools.match(new RegExp(`\\{ name: "${n}",[\\s\\S]*?\\) \\},\\n`)) || [""])[0];
+    if (/confirm:true/.test(def)) return `${n} still tells the model to pass confirm:true, which is ignored -> it believes the action ran`;
+    if (/confirm: bool\(/.test(def)) return `${n} still has an inert confirm input`;
+  }
+  const loop = read("lib/concierge/loop.ts");
+  if (/confirm:true/.test(loop)) return "the system prompt still teaches the ignored confirm:true protocol (double confirmation)";
   return null;
 });
 
@@ -864,11 +871,18 @@ check("seam.88 a reminder SERIES dies in ONE confirmation (delete_event takes id
   return null;
 });
 
-check("seam.89 confirming never swallows the rest of the turn ('yes, and book 3pm' still books 3pm)", () => {
+check("seam.89 the confirm tool must be the FIRST call of the turn, answers only THIS turn's question, and is reachable from every lane", () => {
+  const src = read("lib/concierge/dispatch.ts");
+  const fn = src.slice(src.indexOf("async function confirmPendingAction("));
+  if (!/priorRuns \?\? 0\) > 0/.test(fn)) return "confirm_pending_action can run after an email/document/web read in the same turn (injection path)";
+  if (!/offerPending\(party, ctx\?\.inboundId\)/.test(fn)) return "confirm_pending_action does not re-check that the question was offered to THIS inbound";
+  if (!/open\.id !== String\(input\?\.id/.test(fn)) return "confirm_pending_action does not verify the id matches the open question";
   const loop = read("lib/concierge/loop.ts");
-  if (!/export function isBareConfirmation/.test(loop)) return "isBareConfirmation missing; a compound confirm would short-circuit the model";
-  if (!/isBareConfirmation\(lastUser\)/.test(loop)) return "the short-circuit is not gated on a BARE confirmation";
-  if (!/if \(confirmOutcome\) reply = /.test(loop)) return "a compound confirm's outcome is never prepended to the model reply; the execution would go unreported";
+  if (!/priorRuns: runs\.length/.test(loop)) return "the loop does not tell runAction how many tools already ran this turn";
+  if (!/tu\.name === "confirm_pending_action" && r\.ok && r\.result\?\.executed_tool/.test(loop)) return "the executed tool is not recorded for the honesty rail";
+  const router = read("lib/concierge/router.ts");
+  const cc = router.slice(router.indexOf("const CROSS_CUTTING"), router.indexOf("];", router.indexOf("const CROSS_CUTTING")));
+  if (!/"confirm_pending_action"/.test(cc)) return "confirm_pending_action is not cross-cutting; in a narrow lane the model could not confirm";
   return null;
 });
 
@@ -891,6 +905,40 @@ check("seam.91 the monitor reads wall drops through a count-only endpoint with i
   if (/content:\s*r\.content|body:/.test(src)) return "endpoint may return message content; it must return counts and guard labels only";
   const mw = read("middleware.ts");
   if (!/"\/api\/health"/.test(mw)) return "/api/health is behind the cookie wall; the monitor would get a /login redirect";
+  return null;
+});
+
+check("seam.92 a held action is answerable by exactly ONE reply; a later casual yes cannot fire it (review blocker A)", () => {
+  const pa = read("lib/concierge/pending-actions.ts");
+  if (!/export async function offerPending/.test(pa)) return "offerPending missing";
+  if (!/if \(a\.offered_to\) \{ await setValue\(r\.key, \{ \.\.\.a, status: "cancelled" \}\)/.test(pa)) return "a proposal that already had its reply is not cancelled";
+  if (!/value->>offered_to=is\.null/.test(pa)) return "binding a proposal to an inbound is not atomic";
+  if (!/if \(a\.offered_to !== inboundId\) return null/.test(pa)) return "claimPending accepts a confirmation from an inbound the question was not offered to";
+  if (!/status: "cancelled" \}\);\n    \}\n    if \(same\) return same;/.test(pa)) return "proposing does not cancel older open questions (two questions could be in flight)";
+  return null;
+});
+
+check("seam.93 the words a human reads after a confirmation come from what ACTUALLY happened (review blocker E)", () => {
+  const src = read("lib/concierge/dispatch.ts");
+  const ra = src.slice(src.indexOf("export async function runAction("));
+  if (!/\(result as any\)\.ok === false\) \{\n      return \{ ok: false/.test(ra)) return "a handler's own {ok:false} is still wrapped as success (a failed email reads as 'Sent.')";
+  const d = src.slice(src.indexOf("export function describeOutcome"));
+  if (!/if \(!r\.ok\) return `That did not go through/.test(d)) return "a failed action can still produce a success line";
+  if (!/r\.result\.deleted\.length/.test(d)) return "the deleted count is not taken from the rows actually deleted";
+  if (!/already gone/.test(d)) return "zero rows deleted can still read as 'Done'";
+  if (!/Test turn/.test(d)) return "a simulated dev turn can still read as 'Done. Cleared'";
+  const ops = read("lib/concierge/ops.ts");
+  if (!/sbDeleteReturning<\{ id: string \}>\(\n    "events"/.test(ops)) return "deleteEvent does not return the rows the database actually removed";
+  return null;
+});
+
+check("seam.94 a test turn can never send email, invite or ring a phone from Jensen's accounts (Law 10)", () => {
+  const src = read("lib/concierge/dispatch.ts");
+  const set = src.slice(src.indexOf("export const OUTWARD_SENDS"), src.indexOf("]);", src.indexOf("export const OUTWARD_SENDS")));
+  for (const t of ["send_email", "reply_email", "send_meeting_invite", "call_owner", "sanad_draft_contract"]) {
+    if (!set.includes(`"${t}"`)) return `${t} is not walled on a non-Jensen turn`;
+  }
+  if (!/TENANT_WRITES\.has\(name\) \|\| OUTWARD_SENDS\.has\(name\)/.test(src)) return "skipTenantWriteForDev ignores OUTWARD_SENDS";
   return null;
 });
 

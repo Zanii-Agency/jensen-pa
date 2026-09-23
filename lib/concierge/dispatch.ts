@@ -49,8 +49,13 @@ const TENANT_WRITES = new Set<string>([
 ]);
 // True when this write must be walled off: a real persistent write to Jensen's
 // tenant requested by anyone other than Jensen himself.
+// Outward sends that a test turn must never really make. Before 2026-09-23 these
+// were missing from the wall, so a developer typing "yes" during a test could send
+// a real email from Jensen's mailbox or ring his phone (a Law 10 breach, the same
+// class as the 2026-09-09 zanii.ai incident).
+export const OUTWARD_SENDS = new Set<string>(["send_email", "reply_email", "send_meeting_invite", "call_owner", "sanad_draft_contract"]);
 export function skipTenantWriteForDev(name: string, party?: string): boolean {
-  return !!party && party !== "jensen" && TENANT_WRITES.has(name);
+  return !!party && party !== "jensen" && (TENANT_WRITES.has(name) || OUTWARD_SENDS.has(name));
 }
 import { kvGet } from "../db";
 import { sbSelect, enc } from "./rest";
@@ -203,17 +208,47 @@ const DESTRUCTIVE = new Set([
   "sanad_draft_contract",
 ]);
 
-// A genuine affirmation FROM THE OWNER (not the model). Bounded so "yesterday"
-// and the like never match; negations ("no, don't") never match.
-const CONFIRM_RE = /\b(yes+|yep|yeah|yup|ya|okay|ok|k|sure|fine|correct|right|absolutely|100%?|confirm|confirmed|go ahead|go for it|do it|do that|send it|delete it|please do|that'?s right|approved)\b|👍/i;
+// Deterministic reply classification, used ONLY for the fast path that skips the
+// model. It is deliberately tiny: the WHOLE final line must be an exact bare
+// yes or an exact bare no. Everything else returns null and goes to the model,
+// which reads meaning in context far better than a word list.
+//
+// Why so strict (adversarial review 2026-09-23): the previous parser matched a
+// yes-WORD anywhere in the line, so it CONFIRMED "Don't do it" ("do it"), "not
+// sure" ("sure"), "Is that right?" ("right"), "ok thanks", "I'm fine", "do not
+// confirm" -- while "stop them", Jensen's actual request, read as a no. Whether
+// "stop them" means yes depends on what was asked, which no regex can know.
+const BARE_YES = new Set([
+  "yes", "yeah", "yep", "yup", "ya", "ok", "okay", "k", "sure", "confirm", "confirmed",
+  "go ahead", "do it", "go for it", "please do", "yes please", "approved", "correct",
+  "absolutely", "100", "100%", "fine", "yes go ahead", "yes do it", "ok go ahead", "sure go ahead",
+  "yes confirm", "ok do it", "👍",
+]);
+const BARE_NO = new Set([
+  "no", "nope", "nah", "no thanks", "dont", "don't", "do not", "no dont", "no don't",
+  "not now", "not yet", "wait", "hold on", "leave it", "leave them", "keep it", "keep them",
+  "never mind", "nevermind", "no leave it", "no keep it", "no keep them",
+]);
+function finalLine(text: string): string {
+  // A coalesced burst joins lines with "\n"; the owner's FINAL line governs.
+  const lines = String(text || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  return (lines[lines.length - 1] || "")
+    .toLowerCase()
+    .replace(/[’`]/g, "'")
+    .replace(/[.!?,;:]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+export function classifyReply(text: string): "yes" | "no" | null {
+  const t = finalLine(text);
+  if (!t) return null;
+  if (BARE_YES.has(t)) return "yes";
+  if (BARE_NO.has(t)) return "no";
+  return null;
+}
+// Kept for callers/tests: true ONLY for an exact bare affirmation.
 export function isConfirmation(text: string): boolean {
-  // Skeptic #6: a coalesced burst joins lines with "\n"; the owner's FINAL line
-  // governs. "yes\nactually wait no" must read as the reversal, not the yes.
-  const lines = String(text || "").split("\n").map((s) => s.trim()).filter(Boolean);
-  const t = lines[lines.length - 1] || "";
-  if (!t) return false;
-  if (/\b(no|don'?t|do not|cancel|stop|wait|not yet|never ?mind)\b/i.test(t) && !/\b(yes|confirm|go ahead|do it)\b/i.test(t)) return false;
-  return CONFIRM_RE.test(t);
+  return classifyReply(text) === "yes";
 }
 
 // C1 FIX (was self-gatable): a destructive/outbound tool no longer executes on a
@@ -226,76 +261,195 @@ export function isDestructive(name: string): boolean {
   return DESTRUCTIVE.has(name);
 }
 
-// ADR-0002 Phase 1. The gate no longer just REFUSES, it PROPOSES.
+// ADR-0002 Phase 1. A destructive call is HELD, never run inline.
 //
-// WHY THIS CHANGED (the 16-Sep DJ incident). The old gate let a destructive call
-// through only when the owner's LAST message matched a yes-pattern. That is the
-// right shape for "bot proposes, owner approves" and the WRONG shape for "owner
-// asks for something destructive", which is how a person actually talks. Jensen
-// tried four times to stop a reminder series: "Payment made for Dj", "DJ payment
-// done", "stop sending me reminder for DJ payment", "no need to send me reminder
-// again about this I already paid him". The gate refused all four, and because
-// two of them contain "stop" / "no", the negation branch read his REQUEST to
-// cancel as him DECLINING to cancel. Six more reminders fired, and the model,
-// with no clean way to surface a refusal, told him they were "wiped". They were
-// never deleted: all five rows were still in the events table a week later.
+// History: the gate used to let a destructive call through when the owner's LAST
+// message matched a yes-word. On 16 Sep Jensen asked four times to stop a
+// reminder series; every attempt was refused (and "stop"/"no need" read as him
+// declining), and the model told him the reminders were "wiped". They never were.
 //
-// Now an unconfirmed destructive call writes a durable pending_actions row and
-// returns an echo+ask. A DETERMINISTIC router (confirmRouter in loop.ts), not the
-// model, executes it when a DISTINCT later inbound confirms. So "stop the
-// reminders" is asked once and confirmed once, instead of silently refused.
+// Now the gate writes the question ITSELF from the real rows, holds the action
+// with exactly those rows, and returns that text for the model to relay verbatim.
+// So what Jensen confirms and what executes cannot drift apart (review blocker B).
+// Execution happens only through executePending, reached from the deterministic
+// fast path in loop.ts or the confirm_pending_action tool, both of which require
+// the proposal to have been offered to THIS inbound (see pending-actions.ts).
 //
-// Self-confirm (Class C1) stays dead: the model's own `confirm` field is still
-// ignored, `_confirmed` is server-set only, and confirmAndClaim refuses a confirm
-// whose inbound id equals the proposing inbound id.
-//
-// FAIL-SAFE: if pending_actions is absent (migration not yet applied)
-// proposePending returns null and this falls back to the previous behaviour, so
-// the change is never worse than what already shipped.
+// FAILS CLOSED: if the action cannot be held, it is refused. There is no longer
+// any path where a destructive tool runs because of words in the last message.
 async function destructiveGate(
   name: string,
   input: any,
-  lastUser: string,
-  ctx?: { party?: string; inboundId?: string | null },
+  ctx?: { party?: string; lastUser?: string; inboundId?: string | null; confirmedPendingId?: string | null },
 ): Promise<{ ok: boolean; error?: string } | null> {
   if (!DESTRUCTIVE.has(name)) return null;
-  if (input?._confirmed === true) return null; // server-set by the confirm-router only
+  if (ctx?.confirmedPendingId) return null; // set only by executePending, never reachable from model input
+
+  const d = await describeProposal(name, input);
+  if (d.nothing) return { ok: false, error: `NOTHING TO DO: ${d.nothing}` };
 
   const pending = await proposePending({
     party: ctx?.party || "jensen",
     tool: name,
-    args: sanitizeArgs(input),
+    args: d.args,
+    echo: d.echo,
+    proposedText: ctx?.lastUser || "",
     proposedInboundId: ctx?.inboundId ?? null,
   });
-
   if (!pending) {
-    if (isConfirmation(lastUser)) return null;
     return {
       ok: false,
       error:
-        `Destructive tool '${name}' refused: the owner has not confirmed. ` +
-        `JENSEN-DOCTRINE Law 8: write tools never run inline. ` +
-        `Ask a clear yes/no ('Delete X? Reply yes to confirm') and wait.`,
+        `NOT DONE and NOT HELD: I could not set '${name}' up for confirmation just now. ` +
+        `Tell Jensen plainly it did not happen and to ask again in a moment. Never say it is done.`,
     };
   }
-
   return {
     ok: false,
     error:
-      `PROPOSED, NOT DONE. '${name}' is held awaiting the owner's confirmation. ` +
-      `Say plainly what you are about to do and ask for a yes, in one short line ` +
-      `(for example: "That clears the 4 remaining DJ reminders. Confirm?"). ` +
-      `You MUST NOT say it is done, cleared, wiped, cancelled or removed. Nothing ` +
-      `has happened yet. It runs only when his NEXT message confirms it.`,
+      `HELD, NOTHING HAS HAPPENED YET. Relay exactly this question to Jensen, word for word, ` +
+      `and nothing else about this action: "${pending.echo}" ` +
+      `Do not say it is done, cleared, removed, cancelled or sent. When his next message answers ` +
+      `it, call confirm_pending_action FIRST with id "${pending.id}".`,
   };
 }
 
-// The stored args are replayed by the router, so strip the model's own confirm
-// flags before persisting: they must never ride back in as if the server set them.
-function sanitizeArgs(input: any): any {
-  if (!input || typeof input !== "object") return input ?? {};
-  const { confirm, _confirmed, ...rest } = input as Record<string, unknown>;
-  return rest;
+// The question Jensen confirms, written by CODE from the real rows, plus the exact
+// args that will execute. Rows that no longer exist are dropped from both, so the
+// count he reads is the count that runs.
+type Proposal = { echo: string; args: any; nothing?: string };
+const q = (v: unknown) => `"${String(v ?? "").replace(/"/g, "'").slice(0, 80)}"`;
+function whenOf(date?: string, time?: string): string {
+  if (!date) return time || "";
+  const d = new Date(`${date}T00:00:00Z`);
+  const day = isNaN(d.getTime()) ? date : d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
+  return time ? `${day} ${String(time).slice(0, 5)}` : day;
+}
+function idList(input: any): string[] {
+  const raw = Array.isArray(input?.ids) && input.ids.length
+    ? input.ids
+    : typeof input?.ids === "string" && input.ids.trim()
+      ? input.ids.split(/[,\s]+/)
+      : [input?.id];
+  return [...new Set(raw.map((x: unknown) => String(x ?? "").trim()).filter(Boolean))] as string[];
+}
+async function oneRow(table: string, id: unknown, cols: string): Promise<any | null> {
+  if (id === undefined || id === null || id === "") return null;
+  const rows = await sbSelect<any>(table, `select=${cols}&id=eq.${enc(String(id))}&limit=1`);
+  return rows?.[0] ?? null;
+}
+export async function describeProposal(name: string, input: any): Promise<Proposal> {
+  const gone = (what: string) => ({ echo: "", args: {}, nothing: `that ${what} no longer exists. Re-check before asking Jensen anything.` });
+  switch (name) {
+    case "delete_event": {
+      const ids = idList(input);
+      if (!ids.length) return gone("event");
+      const rows = await sbSelect<any>("events", `select=id,title,date,time&id=in.(${ids.map(enc).join(",")})`);
+      if (!rows.length) return gone("event");
+      rows.sort((a: any, b: any) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`));
+      const args = { ids: rows.map((r: any) => r.id) };
+      if (rows.length === 1) return { args, echo: `That removes ${q(rows[0].title)} (${whenOf(rows[0].date, rows[0].time)}) from your calendar. Confirm?` };
+      const shown = rows.slice(0, 6).map((r: any) => `${r.title} (${whenOf(r.date, r.time)})`).join("; ");
+      const more = rows.length > 6 ? `; and ${rows.length - 6} more` : "";
+      return { args, echo: `That removes ${rows.length} from your calendar: ${shown}${more}. Confirm?` };
+    }
+    case "delete_task": {
+      const r = await oneRow("tasks", input?.id, "id,title"); if (!r) return gone("task");
+      return { args: { id: r.id }, echo: `That deletes the task ${q(r.title)}. Confirm?` };
+    }
+    case "delete_entity": {
+      const r = await oneRow("entities", input?.id, "id,name,kind"); if (!r) return gone("entry");
+      return { args: { id: r.id }, echo: `That deletes the ${r.kind || "entry"} ${q(r.name)}. Confirm?` };
+    }
+    case "delete_contact": {
+      const r = await oneRow("contacts", input?.id, "id,name"); if (!r) return gone("contact");
+      return { args: { id: r.id }, echo: `That deletes the contact ${q(r.name)}. Confirm?` };
+    }
+    case "delete_note": {
+      const r = await oneRow("notes", input?.id, "id,title,body"); if (!r) return gone("note");
+      return { args: { id: r.id }, echo: `That deletes the note ${q(r.title || r.body)}. Confirm?` };
+    }
+    case "delete_document": {
+      const r = await oneRow("docs", input?.id, "id,title,file_name"); if (!r) return gone("document");
+      return { args: { id: r.id }, echo: `That deletes the document ${q(r.title || r.file_name)}. Confirm?` };
+    }
+    case "delete_finance": {
+      const r = await oneRow("finance", input?.id, "id,label,amount,date,kind"); if (!r) return gone("entry");
+      return { args: { id: r.id }, echo: `That deletes the ${r.kind || "finance"} entry ${q(r.label)} (AED ${r.amount}, ${whenOf(r.date)}). Confirm?` };
+    }
+    case "forget_memory": {
+      const r = await oneRow("brain_facts", input?.id, "id,fact"); if (!r) return gone("memory");
+      return { args: { id: r.id }, echo: `That forgets: ${q(r.fact)}. Confirm?` };
+    }
+    case "send_email":
+      return { args: input, echo: `That sends an email to ${input?.to} with the subject ${q(input?.subject)}. Confirm?` };
+    case "reply_email": {
+      let to = "the sender";
+      try { const f: any = await readUnified(input?.id); to = f?.fromEmail || to; } catch { return gone("email"); }
+      return { args: input, echo: `That sends your reply to ${to}, starting ${q(String(input?.body || "").split("\n")[0])}. Confirm?` };
+    }
+    case "send_meeting_invite":
+      return { args: input, echo: `That sends ${input?.attendeeName || input?.attendeeEmail} a calendar invite for ${q(input?.title)} on ${whenOf(input?.date, input?.time)} Dubai time. Confirm?` };
+    case "call_owner":
+      return { args: input, echo: `That rings your phone and says: ${q(input?.message)}. Confirm?` };
+    default:
+      return { args: input, echo: `That runs ${name.replace(/_/g, " ")}. Confirm?` };
+  }
+}
+
+// The only way a held action executes. Callers must already hold a CLAIMED
+// proposal (claimPending succeeded for this inbound). Runs the stored tool with
+// the stored args, re-running the name-mismatch wall against the message that
+// ASKED for it (not the bare "yes"), writes a durable audit row, and returns what
+// actually happened in words a human reads.
+export async function executePending(
+  claimed: { id: string; tool: string; args: any; proposed_text: string; echo: string },
+  ctx: { party: string; inboundId?: string | null },
+): Promise<{ ok: boolean; executedTool: string; outcome: string; result?: any }> {
+  const r = await runAction(claimed.tool, claimed.args, {
+    party: ctx.party,
+    lastUser: claimed.proposed_text,
+    inboundId: ctx.inboundId,
+    confirmedPendingId: claimed.id,
+  });
+  const outcome = describeOutcome(claimed.tool, r);
+  const ok = r.ok && !r.result?.simulated;
+  const { markExecuted } = await import("./pending-actions");
+  await markExecuted(claimed.id, { ok: r.ok, result: r.result, error: r.error });
+  try {
+    const { admin } = await import("@/lib/db");
+    await admin().from("chat_messages").insert({
+      role: "system",
+      channel: "audit",
+      party: ctx.party,
+      ts: Date.now(),
+      content: `confirmed_action: ${claimed.tool} ok=${r.ok} | asked: ${claimed.echo.slice(0, 200)} | outcome: ${outcome}`.slice(0, 500),
+    });
+  } catch { /* the kv record still holds the outcome */ }
+  return { ok, executedTool: claimed.tool, outcome, result: r.result };
+}
+
+// What a human reads after a confirmation, derived from what ACTUALLY happened.
+// Never "Done" for a failure, never a count that was proposed rather than deleted.
+export function describeOutcome(tool: string, r: { ok: boolean; result?: any; error?: string }): string {
+  if (!r.ok) return `That did not go through, so nothing changed. ${String(r.error || "").split(".")[0].slice(0, 140)}`.trim();
+  if (r.result?.simulated) return "Test turn: nothing was actually changed.";
+  if (tool === "delete_event") {
+    const n = Array.isArray(r.result?.deleted) ? r.result.deleted.length : 0;
+    if (n === 0) return "Those were already gone, so there was nothing to remove.";
+    return n === 1 ? "Done. Removed from your calendar." : `Done. Removed all ${n} from your calendar.`;
+  }
+  if (tool === "delete_task") return "Done. Off your board.";
+  if (tool === "delete_contact") return "Done. Contact removed.";
+  if (tool === "delete_note") return "Done. Note removed.";
+  if (tool === "delete_document") return "Done. Document removed.";
+  if (tool === "delete_finance") return "Done. Entry removed.";
+  if (tool === "delete_entity") return "Done. Removed.";
+  if (tool === "forget_memory") return "Done. Forgotten.";
+  if (tool === "send_email" || tool === "reply_email") return `Sent to ${r.result?.to || "them"}.`;
+  if (tool === "send_meeting_invite") return "Invite sent.";
+  if (tool === "call_owner") return "Calling you now.";
+  return "Done.";
 }
 
 async function financeSummary(i: { entityId?: string; from?: string; to?: string }) {
@@ -385,15 +539,27 @@ const GEN_SYS = (kind: string) =>
 const LEGAL_SYS = (kind: string, blueprint: string) =>
   `You are Rencontre, drafting a UAE ${kind} for Jensen / La Rencontre. Ground it in this legal blueprint where relevant:\n${blueprint || "(no blueprint saved yet; use sensible UAE defaults and flag where Jensen must fill specifics)"}\nDraft a clear, professional document under Dubai/UAE law. Add a short note that a UAE lawyer should review before signing. ${NO_DASHES} Output the document body only.`;
 
-export async function runAction(name: string, input: any, ctx?: { party?: string; lastUser?: string; inboundId?: string | null }): Promise<{ ok: boolean; result?: Result; error?: string }> {
+export async function runAction(
+  name: string,
+  rawInput: any,
+  ctx?: { party?: string; lastUser?: string; inboundId?: string | null; priorRuns?: number; confirmedPendingId?: string | null },
+): Promise<{ ok: boolean; result?: Result; error?: string }> {
   try {
-    const gated = await destructiveGate(name, input, ctx?.lastUser || "", { party: ctx?.party, inboundId: ctx?.inboundId });
+    // Confirmation state travels ONLY in ctx, which code builds. Any confirm-ish
+    // field on the model's own tool input is discarded here, so an instruction
+    // smuggled in through an email or document can never mark an action approved
+    // (review blocker C: the old gate honoured input._confirmed).
+    const input = stripConfirmFlags(rawInput);
+
+    if (name === "confirm_pending_action") return confirmPendingAction({ ...input, confirm: rawInput?.confirm }, ctx);
+
+    const gated = await destructiveGate(name, input, ctx);
     if (gated) return gated;
     // Party wall: a non-Jensen (admin/dev/test) turn never persists to Jensen's
     // tenant. Return a simulated result so the model can tell the operator what it
     // WOULD have done, without polluting the client's board / brief / portal.
     if (skipTenantWriteForDev(name, ctx?.party)) {
-      return { ok: true, result: { simulated: true, tool: name, persisted: false, note: "Dev/admin turn: not written to Jensen's tenant (single-tenant wall). Change Jensen's real data through his own portal." } };
+      return { ok: true, result: { simulated: true, tool: name, persisted: false, note: OUTWARD_SENDS.has(name) ? "Dev/admin turn: nothing was sent (Law 10: test traffic never reaches a real person)." : "Dev/admin turn: not written to Jensen's tenant (single-tenant wall). Change Jensen's real data through his own portal." } };
     }
     let result: Result;
     switch (name) {
@@ -698,8 +864,53 @@ export async function runAction(name: string, input: any, ctx?: { party?: string
       // imports otherwise). Fire-and-forget; waitUntil inside keeps it alive.
       import("../zanii").then(({ recordAction }) => recordAction(name, { input: input ?? {}, ok: actionOk })).catch(() => {});
     }
+    // A handler that caught its own failure returns {ok:false,...}. That used to be
+    // wrapped as ok:true, so a failed email read as success to the loop and the
+    // honesty rail, and a confirmation could report "Sent." (review blocker E).
+    if (result && typeof result === "object" && (result as any).ok === false) {
+      return { ok: false, error: String((result as any).error || (result as any).summary || JSON.stringify(result)).slice(0, 500) };
+    }
     return { ok: true, result };
   } catch (e: any) {
     return { ok: false, error: e?.message || String(e) };
   }
+}
+
+function stripConfirmFlags(input: any): any {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return input ?? {};
+  const { confirm, _confirmed, confirmed, ...rest } = input as Record<string, unknown>;
+  return rest;
+}
+
+// The model's way to answer a held question when his reply is not a bare yes/no
+// ("stop them", "go on then", "don't do it"). The model supplies the MEANING; code
+// enforces everything that makes it safe:
+//  - the proposal must have been offered to THIS inbound (a later, distinct message
+//    from Jensen), and only this one (pending-actions.ts rule 2/3);
+//  - it must be the FIRST tool call of the turn, before any email, document or web
+//    content has been read, so injected text cannot trigger it;
+//  - the claim is single-use and atomic.
+async function confirmPendingAction(
+  input: any,
+  ctx?: { party?: string; inboundId?: string | null; priorRuns?: number },
+): Promise<{ ok: boolean; result?: Result; error?: string }> {
+  const party = ctx?.party || "jensen";
+  if ((ctx?.priorRuns ?? 0) > 0) {
+    return { ok: false, error: "confirm_pending_action must be the FIRST tool call of the turn. Nothing was done. Ask Jensen to confirm again." };
+  }
+  const { offerPending, claimPending, cancelPending } = await import("./pending-actions");
+  const open = await offerPending(party, ctx?.inboundId);
+  if (!open || open.id !== String(input?.id || "")) {
+    return { ok: false, error: "There is no open question with that id for this message. Nothing was done; do not claim it was." };
+  }
+  if (input?.confirm !== true && input?.answer !== "yes") {
+    await cancelPending(open.id);
+    return { ok: true, result: { cancelled: true, outcome: "Left it as it is." } };
+  }
+  const claimed = await claimPending(open.id, ctx?.inboundId);
+  if (!claimed) return { ok: false, error: "That confirmation could not be applied (already handled or expired). Nothing new was done." };
+  const x = await executePending(claimed, { party, inboundId: ctx?.inboundId });
+  return x.ok || /Test turn/.test(x.outcome)
+    ? { ok: true, result: { executed_tool: x.executedTool, outcome: x.outcome, result: x.result } }
+    : { ok: false, error: x.outcome };
 }

@@ -1,32 +1,57 @@
 // Live end-to-end check of the confirm layer against the REAL kv table.
 //   set -a && . ./.env.prod && set +a && npx tsx scripts/_test-confirm-layer-live.mts
 //
-// Uses the scratch party "selftest". The confirm-router only ever looks up
-// "jensen" / "taona", so nothing here can reach Jensen or execute anything.
-// Every row it writes is deleted at the end. Exits non-zero on any failure.
-import { proposePending, findOpenPending, confirmAndClaim, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
+// Uses the scratch party "selftest". The router only ever looks up "jensen" and
+// "taona", so nothing here can reach Jensen or execute anything. Every row it
+// writes is deleted at the end. Exits non-zero on any failure.
+import { proposePending, offerPending, claimPending, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
 import { sbSelect, sbDelete } from "../lib/concierge/rest";
 
 const P = "selftest";
 const scratch = "key=like." + encodeURIComponent(`pending_action:${P}:*`);
 let failed = 0;
 const ok = (c: boolean, m: string) => { console.log((c ? "PASS " : "FAIL ") + m); if (!c) failed++; };
+const hold = (tool: string, args: any, inbound: string) =>
+  proposePending({ party: P, tool, args, echo: `test ${tool}`, proposedText: "stop the reminders", proposedInboundId: inbound });
 
 try {
-  const a = await proposePending({ party: P, tool: "delete_event", args: { ids: ["e1", "e2", "e3", "e4"] }, proposedInboundId: "wamid.PROPOSE" });
-  ok(!!a && a.status === "pending", "propose writes a pending action");
-  const dup = await proposePending({ party: P, tool: "delete_event", args: { ids: ["e1", "e2", "e3", "e4"] }, proposedInboundId: "wamid.PROPOSE2" });
-  ok(dup?.id === a?.id, "an identical proposal does not create a second thing to confirm");
-  ok((await findOpenPending(P))?.id === a?.id, "the router can find the open proposal");
-  ok((await confirmAndClaim(a!.id, "wamid.PROPOSE")) === null, "self-confirm refused: the proposing message cannot confirm itself");
-  const both = await Promise.all([confirmAndClaim(a!.id, "wamid.YES"), confirmAndClaim(a!.id, "wamid.YES2")]);
-  ok(both.filter(Boolean).length === 1, "two racing confirmations: exactly one executes");
-  await markExecuted(a!.id, { ok: true, result: { deleted: 4 } });
-  ok((await findOpenPending(P)) === null, "once executed it is closed; a later yes cannot re-run it");
-  const b = await proposePending({ party: P, tool: "delete_task", args: { id: "t9" }, proposedInboundId: "wamid.P3" });
-  await cancelPending(b!.id);
-  ok((await findOpenPending(P)) === null, "a declined proposal is retired");
-  ok((await confirmAndClaim(b!.id, "wamid.LATEYES")) === null, "a stale yes after a no cannot resurrect it");
+  // --- the happy path: asked in X, answered in Y ---
+  const a = await hold("delete_event", { ids: ["e1", "e2", "e3", "e4"] }, "wamid.X");
+  ok(!!a && a.status === "pending" && a.offered_to === null, "holding writes a pending, unoffered action");
+  ok((await offerPending(P, "wamid.X")) === null, "the turn that proposed it cannot be offered it (no self-confirm)");
+  ok((await claimPending(a!.id, "wamid.X")) === null, "the proposing message cannot claim it");
+  const offered = await offerPending(P, "wamid.Y");
+  ok(offered?.id === a!.id && offered?.offered_to === "wamid.Y", "the NEXT message is offered the question");
+  ok((await offerPending(P, "wamid.Y"))?.id === a!.id, "offering is idempotent for the same message (webhook retry)");
+  ok((await claimPending(a!.id, "wamid.OTHER")) === null, "a message it was NOT offered to cannot claim it");
+  const race = await Promise.all([claimPending(a!.id, "wamid.Y"), claimPending(a!.id, "wamid.Y")]);
+  ok(race.filter(Boolean).length === 1, "two racing claims from the offered message: exactly one executes");
+  await markExecuted(a!.id, { ok: true, result: { deleted: ["e1", "e2", "e3", "e4"] } });
+  ok((await offerPending(P, "wamid.Z")) === null, "once executed it can never be offered again");
+
+  // --- review blocker A: a stale proposal must not fire on a later casual yes ---
+  const sara = await hold("delete_task", { id: "sara-follow-up" }, "wamid.A1");
+  ok((await offerPending(P, "wamid.A2"))?.id === sara!.id, "'add dinner with Marc' is the one reply: question offered to it");
+  // ...the model answers Marc's request instead and never confirms. Bot asks "want it on your board?"
+  ok((await offerPending(P, "wamid.A3")) === null, "the NEXT message ('yes' to the board question) is NOT offered the stale delete");
+  ok((await claimPending(sara!.id, "wamid.A3")) === null, "and cannot claim it: Sara's task survives");
+
+  // --- one question in flight ---
+  const q1 = await hold("delete_note", { id: "n1" }, "wamid.B1");
+  const q2 = await hold("delete_contact", { id: "c1" }, "wamid.B2");
+  ok((await offerPending(P, "wamid.B3"))?.id === q2!.id, "a newer proposal replaces the older one");
+  ok((await claimPending(q1!.id, "wamid.B3")) === null, "the replaced proposal can no longer be confirmed");
+
+  // --- no retires it ---
+  const c = await hold("call_owner", { message: "hi" }, "wamid.C1");
+  await offerPending(P, "wamid.C2");
+  await cancelPending(c!.id);
+  ok((await claimPending(c!.id, "wamid.C2")) === null, "a declined proposal cannot be confirmed afterwards");
+
+  // --- identical re-ask does not stack ---
+  const d1 = await hold("delete_event", { ids: ["x"] }, "wamid.D1");
+  const d2 = await hold("delete_event", { ids: ["x"] }, "wamid.D2");
+  ok(d1?.id === d2?.id, "asking for the identical action twice holds ONE thing, not two");
 } finally {
   await sbDelete("kv", scratch);
   const left = await sbSelect("kv", `select=key&${scratch}`);

@@ -21,6 +21,10 @@ export type Domain = "calendar" | "tasks" | "docs" | "comms" | "money" | "genera
 // stays here on the never-worse rule). Everything else moved to the lane(s) that
 // actually use it; `general` (full toolset) still exposes all of them on ambiguity.
 const CROSS_CUTTING = [
+  // confirm_pending_action answers a held delete/send. It must exist in EVERY lane:
+  // "stop them" routes to whatever lane its words suggest, and if the tool is not
+  // there the model cannot confirm and the held action silently lapses.
+  "confirm_pending_action",
   "find_contact", "query_memory", "query_calendar", "get_settings",
   "remember_preference", "add_note",
   // NOTE (KT #206597): remember_fact + entity_dashboard were considered for

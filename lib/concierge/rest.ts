@@ -61,6 +61,13 @@ export async function sbDelete(table: string, qs: string): Promise<void> {
   const r = await fetch(`${base()}/${table}?${qs}`, { method: "DELETE", headers: headers() });
   if (!r.ok) throw new Error(`${table} delete ${r.status}: ${(await r.text()).slice(0, 200)}`);
 }
+// DELETE that returns the rows it actually removed. A count of ids ASKED for is
+// not a count of rows deleted: ids can already be gone (review blocker E).
+export async function sbDeleteReturning<T = any>(table: string, qs: string): Promise<T[]> {
+  const r = await fetch(`${base()}/${table}?${qs}`, { method: "DELETE", headers: headers({ Prefer: "return=representation" }) });
+  if (!r.ok) throw new Error(`${table} delete ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
 export async function sbRpc<T = any>(fn: string, args: any): Promise<T[]> {
   const r = await fetch(`${base()}/rpc/${fn}`, { method: "POST", headers: headers(), body: JSON.stringify(args) });
   if (!r.ok) throw new Error(`rpc ${fn} ${r.status}: ${(await r.text()).slice(0, 200)}`);
