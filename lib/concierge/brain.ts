@@ -3,7 +3,7 @@
 // PostgREST (rest.ts) so it is deterministic on Node 20 + Vercel. Server-only.
 
 import { sbSelect, sbInsert, sbUpdate, sbRpc, enc } from "./rest";
-import { searchFacts, searchDocs, searchSaid } from "./memory-search";
+import { searchFacts, searchDocs, searchSaid, labelFact, type FoundFact } from "./memory-search";
 import { claudeJSON } from "../anthropic";
 import { embed as openaiEmbed } from "../openai";
 
@@ -11,11 +11,18 @@ const vec = (e: number[]) => `[${e.join(",")}]`;
 const RRF_K = 60;
 const now = () => Date.now();
 
+// Circuit breaker: the embed key has returned 401 since at least June, and every
+// turn paid a failed OpenAI round trip (~250ms measured 2026-09-23) for nothing.
+// After an auth failure, skip embedding for 30 minutes; a working key is picked
+// up again automatically once the window passes.
+let embedDeadUntil = 0;
 async function tryEmbed(text: string): Promise<number[] | null> {
+  if (Date.now() < embedDeadUntil) return null;
   try {
     const [e] = await openaiEmbed([text.slice(0, 4000)]);
     return e || null;
-  } catch {
+  } catch (err: any) {
+    if (/\b40[13]\b/.test(String(err?.message || err))) embedDeadUntil = Date.now() + 30 * 60_000;
     return null;
   }
 }
@@ -127,7 +134,7 @@ export async function recall(query: string, opts?: { factK?: number; docK?: numb
   // effectively off. memory-search.ts searches the important words instead.
   const [qe, factKwFacts, kwDocs, said] = await Promise.all([
     tryEmbed(q),
-    factK ? searchFacts(q, 10) : Promise.resolve([] as string[]),
+    factK ? searchFacts(q, 10) : Promise.resolve([] as FoundFact[]),
     docK ? searchDocs(q, 10) : Promise.resolve([] as { title: string; content: string }[]),
     // The SPEAKER's own past words: on a developer turn, Jensen's messages must not
     // be presented as things the developer said (review, finding 9).
@@ -136,8 +143,13 @@ export async function recall(query: string, opts?: { factK?: number; docK?: numb
 
   // FACTS
   const factVec: any[] = qe ? await sbRpc("match_brain_facts", { query_embedding: vec(qe), match_count: 10 }).catch(() => []) : [];
-  const factKw: any[] = factKwFacts.map((fact) => ({ fact }));
-  const facts = factK ? rrf<any>([factVec, factKw], (r) => r.fact).slice(0, factK).map((r) => r.fact) : [];
+  // Merge on the RAW fact text (so a fact found by both searches counts once), then
+  // label by source. Vector-only hits carry no source here and stay unlabelled.
+  const labels = new Map(factKwFacts.map((f) => [f.fact, f] as const));
+  const factKw: any[] = factKwFacts.map((f) => ({ fact: f.fact }));
+  const facts = factK
+    ? rrf<any>([factVec, factKw], (r) => r.fact).slice(0, factK).map((r) => labelFact(labels.get(r.fact) ?? { fact: r.fact, label: "" }))
+    : [];
 
   // DOCS
   const docVec: any[] = qe && docK ? await sbRpc("match_doc_chunks", { query_embedding: vec(qe), match_count: 10 }).catch(() => []) : [];

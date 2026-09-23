@@ -46,12 +46,17 @@ const STOP = new Set(
 const fold = (s: string) => String(s || "").toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "");
 const isNum = (w: string) => /^\d+$/.test(w);
 
+// Two-letter words that carry the meaning of a message ("the AI workshop" vs the
+// Marisa Peer workshop, a real 18 Sep mix-up). Everything else under 3 letters is
+// too vague to search.
+const SHORT_KEEP = new Set(["ai", "pr", "hr", "ux", "ui", "qr", "pa", "ea"]);
+
 // The words worth searching for, most specific (longest non-number) first. Empty
 // when nothing specific is left: then no search runs at all.
 export function memoryKeywords(text: string, max = 6): string[] {
   const words = fold(text)
     .split(/[^a-z0-9]+/)
-    .filter((w) => (isNum(w) ? w.length >= 2 : w.length >= 3) && !STOP.has(w));
+    .filter((w) => (isNum(w) ? w.length >= 2 : w.length >= 3 || SHORT_KEEP.has(w)) && !STOP.has(w));
   const uniq = [...new Set(words)].sort((a, b) => Number(isNum(a)) - Number(isNum(b)) || b.length - a.length);
   return uniq.some((w) => !isNum(w)) ? uniq.slice(0, max) : [];
 }
@@ -88,26 +93,28 @@ async function fetchTwoPass<T>(table: string, cols: string[], select: string, wo
   return out;
 }
 
-// Saved facts. Facts that came from a third party's email are labelled so they are
-// never presented as something he said; facts from his old ChatGPT export are
-// labelled as older notes (they may be out of date).
-export async function searchFacts(text: string, k = 6): Promise<string[]> {
+// Saved facts, with where each came from. Labelling happens in recall(), AFTER the
+// keyword and vector results are merged, so a fact from a third party's email is
+// never presented as something he said, whichever search found it. Ties go to the
+// newest fact, so of two conflicting facts the more recent one leads.
+export type FoundFact = { fact: string; label: "" | "email" | "older" };
+export async function searchFacts(text: string, k = 6): Promise<FoundFact[]> {
   const words = memoryKeywords(text);
   if (!words.length) return [];
   return withTimeout((async () => {
-    const rows = await fetchTwoPass<{ fact: string; kind: string; source: string }>(
-      "brain_facts", ["fact"], "fact,kind,source", words, "status=eq.active&", 60, (r) => r.fact,
+    const rows = await fetchTwoPass<{ fact: string; kind: string; source: string; created_at: string }>(
+      "brain_facts", ["fact"], "fact,kind,source,created_at", words, "status=eq.active&", 60, (r) => r.fact,
     );
     return rows
       .map((r) => ({ r, s: score(r.fact, words) }))
       .filter((x) => x.s.words > 0)
-      .sort((a, b) => b.s.hits - a.s.hits)
+      .sort((a, b) => b.s.hits - a.s.hits || String(b.r.created_at).localeCompare(String(a.r.created_at)))
       .slice(0, k)
-      .map(({ r }) =>
-        r.source === "email" ? `[from an email he received, unverified] ${r.fact}`
-        : r.kind === "archive_fact" ? `[older note] ${r.fact}`
-        : r.fact);
-  })(), 2500, [] as string[]);
+      .map(({ r }): FoundFact => ({ fact: r.fact, label: r.source === "email" ? "email" : r.kind === "archive_fact" ? "older" : "" }));
+  })(), 2500, [] as FoundFact[]);
+}
+export function labelFact(f: FoundFact): string {
+  return f.label === "email" ? `[from an email he received, unverified] ${f.fact}` : f.label === "older" ? `[older note] ${f.fact}` : f.fact;
 }
 
 // What HE said before, in his own words, dated, NEWEST FIRST. Only short messages
@@ -118,23 +125,33 @@ export async function searchFacts(text: string, k = 6): Promise<string[]> {
 export async function searchSaid(text: string, party = "jensen", k = 3): Promise<{ when: string; text: string }[]> {
   const words = memoryKeywords(text);
   if (!words.length) return [];
-  const key = words[0] && !isNum(words[0]) && words[0].length >= 5 ? words[0] : "";
   return withTimeout((async () => {
     const rows = await fetchTwoPass<{ content: string; ts: number }>(
       "chat_messages", ["content"], "content,ts", words,
       `party=eq.${enc(party)}&role=eq.user&ts=lt.${Date.now() - 90_000}&order=ts.desc&`, 100, (r) => `${r.ts}`,
     );
-    return rows
-      .filter((r) => String(r.content || "").length <= 800)
-      .map((r) => ({ r, s: score(r.content, words) }))
-      .filter((x) => x.s.words >= 2 || (key !== "" && hitsWord(fold(x.r.content), key)))
-      .sort((a, b) => Number(b.r.ts) - Number(a.r.ts))
-      .slice(0, k)
-      .map(({ r }) => ({
+    return pickSaid(rows, words, k)
+      .map((r) => ({
         when: new Date(Number(r.ts)).toLocaleDateString("en-GB", { timeZone: "Asia/Dubai", weekday: "short", day: "numeric", month: "short", year: "numeric" }),
         text: String(r.content).replace(/\s+/g, " ").slice(0, 220),
       }));
   })(), 2500, [] as { when: string; text: string }[]);
+}
+
+// The ranking behind searchSaid, pure so it can be tested without a database.
+// TIERED: messages that hit 2+ of his words come first (newest first among them);
+// messages that only share his single most specific word fill any slots left.
+// Sorting everything by date alone let "final invoice" / "final menu" (newer, one
+// shared word) push out "9:20 final road test" (review round 2 blocker).
+export function pickSaid<R extends { content: string; ts: number }>(rows: R[], words: string[], k = 3): R[] {
+  const key = words[0] && !isNum(words[0]) && words[0].length >= 5 ? words[0] : "";
+  const scored = rows
+    .filter((r) => String(r.content || "").length <= 800)
+    .map((r) => ({ r, s: score(r.content, words) }));
+  const newest = (a: { r: R }, b: { r: R }) => Number(b.r.ts) - Number(a.r.ts);
+  const strong = scored.filter((x) => x.s.words >= 2).sort(newest);
+  const keyOnly = scored.filter((x) => x.s.words < 2 && key !== "" && hitsWord(fold(x.r.content), key)).sort(newest);
+  return [...strong, ...keyOnly].slice(0, k).map((x) => x.r);
 }
 
 // Documents: title or text containing his important words.
