@@ -32,6 +32,7 @@ const STOP = new Set(
     // chat filler and acknowledgements
     "thanks thank perfect great good fine sure cool nice awesome noted sounds works right correct wrong sorry " +
     "hello hey hi dear ahead actually really maybe think know want need like one now else anything something " +
+    "merci cheers bye night much lovely brilliant excellent amazing wonderful welcome appreciate appreciated " +
     // generic verbs of asking the bot to act
     "tell told say said give gave get got put set send sent make made let add added delete remove move moved " +
     "change changed update updated cancel cancelled confirm confirmed keep kept book booked mark " +

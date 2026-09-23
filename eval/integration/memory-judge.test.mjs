@@ -11,7 +11,8 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 
-import { buildPool, judgeIds, mergeSaid } from "../../lib/concierge/memory-judge.ts";
+import { buildPool, judgeIds, mergeSaid, pickedLine } from "../../lib/concierge/memory-judge.ts";
+import { memoryKeywords } from "../../lib/concierge/memory-search.ts";
 
 const day = 864e5, t0 = Date.parse("2026-09-16T07:00:00Z");
 const rows = [
@@ -39,7 +40,7 @@ test("whatever the model returns, only ids of his lines that were shown survive"
   let sent;
   globalThis.fetch = async (_url, init) => {
     sent = JSON.parse(init.body);
-    return new Response(JSON.stringify({ content: [{ type: "text", text: JSON.stringify({ ids: [5, 5, 4, 999, 2, 1] }) }] }), { status: 200 });
+    return new Response(JSON.stringify({ stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ ids: [5, 5, 4, 999, 2, 1] }) }] }), { status: 200 });
   };
   try {
     assert.deepEqual(await judgeIds("did I pay the DJ?", pool), [5, 1]); // 4 = bot line, 999 unknown, 2 = paste
@@ -51,22 +52,65 @@ test("whatever the model returns, only ids of his lines that were shown survive"
 });
 
 test("a judge failure is not an answer: it throws, and recall() falls back to keyword hits", async () => {
+  // Review of PR #13: an empty or refused reply used to read as "nothing relevant"
+  // and silently removed the keyword hits too.
   const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response("overloaded", { status: 529 });
+  const replies = [
+    new Response("overloaded", { status: 529 }),
+    new Response(JSON.stringify({ stop_reason: "refusal", content: [] }), { status: 200 }),
+    new Response(JSON.stringify({ stop_reason: "max_tokens", content: [{ type: "text", text: '{"ids":[5' }] }), { status: 200 }),
+    new Response(JSON.stringify({ stop_reason: "end_turn", content: [] }), { status: 200 }),
+    new Response(JSON.stringify({ stop_reason: "end_turn", content: [{ type: "text", text: "{}" }] }), { status: 200 }),
+  ];
   try {
-    await assert.rejects(judgeIds("did I pay the DJ?", buildPool(rows)));
+    for (const r of replies) {
+      globalThis.fetch = async () => r;
+      await assert.rejects(judgeIds("did I pay the DJ?", buildPool(rows)));
+    }
   } finally {
     globalThis.fetch = real;
   }
 });
 
+test("small talk runs no search and no judge call", () => {
+  for (const s of ["merci", "Thank you so much", "Brilliant", "Good night", "cheers", "ok thanks"]) {
+    assert.deepEqual(memoryKeywords(s), [], s);
+  }
+});
+
 test("merged with keyword hits: judge first, each message once, newest first, at most 4", () => {
   const m = (ts) => ({ when: String(ts), text: `line ${ts}`, ts });
-  // The judge read everything from ts 25 on: keyword hits at 30/40/50 are lines it
-  // turned down, so only the older ones (20, 5) may fill the spare slots.
-  assert.deepEqual(mergeSaid({ picks: [m(30)], coveredSince: 25 }, [m(50), m(40), m(30), m(20), m(5)], 4).map((x) => x.ts), [30, 20, 5]);
+  // The judge read ts 25..45: keyword hits at 30/40 are lines it turned down. Hits
+  // outside its range (20 and 5 older, 50 among the newest messages it skips) count.
+  assert.deepEqual(mergeSaid({ picks: [m(30)], from: 25, to: 45 }, [m(50), m(40), m(30), m(20), m(5)], 4).map((x) => x.ts), [50, 30, 20, 5]);
   // The judge picked nothing in its range: still nothing from that range.
-  assert.deepEqual(mergeSaid({ picks: [], coveredSince: 25 }, [m(40)], 4), []);
+  assert.deepEqual(mergeSaid({ picks: [], from: 25, to: 45 }, [m(40)], 4), []);
   // The judge did not run or failed (null): keyword hits stand alone.
   assert.deepEqual(mergeSaid(null, [m(1), m(2)], 4).map((x) => x.ts), [2, 1]);
+});
+
+test("a correction he made in the last few messages keeps its date (portal and WhatsApp)", () => {
+  // Review of PR #13, findings 1 and 2: the original "9:30" is in the judge's range,
+  // the fresh "moved to 11" is among the newest messages the judge skips. Both must show.
+  const m = (ts, text) => ({ when: String(ts), text, ts });
+  const judged = { picks: [m(30, "Dentist Monday at 9:30")], from: 25, to: 45 };
+  const out = mergeSaid(judged, [m(60, "dentist moved to 11"), m(30, "Dentist Monday at 9:30")], 4);
+  assert.deepEqual(out.map((x) => x.text), ["dentist moved to 11", "Dentist Monday at 9:30"]);
+});
+
+test("a picked line comes with what the bot answered then, so a declined request is not read as a change", () => {
+  // Review of PR #13, finding 7: "can we move the Kobe lunch to 2pm?" alone made the
+  // main model's "newest wins" rule state 2pm, though the answer was no.
+  const t = Date.parse("2026-09-10T08:00:00Z");
+  const pool = buildPool([
+    { id: 21, role: "user", ts: t, content: "can we move the Kobe lunch to 2pm?" },
+    { id: 22, role: "assistant", ts: t + 60e3, content: "Kobe's office says 2pm does not work for them, so lunch stays at 13:00." },
+    { id: 23, role: "user", ts: t + 3600e3, content: "ok" },
+    { id: 24, role: "user", ts: t + 2 * 3600e3, content: "sent the deck" },
+    { id: 25, role: "assistant", ts: t + 5 * 3600e3, content: "Much later, unrelated." },
+  ]);
+  assert.match(pickedLine(pool, 21).text, /^can we move the Kobe lunch to 2pm\? \(my reply then: Kobe's office says 2pm does not work/);
+  // No bot answer after it, or only one hours later: nothing is attached.
+  assert.equal(pickedLine(pool, 23).text, "ok");
+  assert.equal(pickedLine(pool, 24).text, "sent the deck");
 });
