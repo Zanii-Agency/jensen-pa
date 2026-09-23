@@ -75,7 +75,7 @@ function score(text: string, words: string[]): { hits: number; words: number } {
   return { hits: hits - (t.length > 400 ? 0.5 : 0), words: wordHits };
 }
 
-const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
+export const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
   Promise.race([p.catch(() => fallback), new Promise<T>((r) => setTimeout(() => r(fallback), ms))]);
 const ilikes = (col: string, words: string[]) => words.map((w) => `${col}.ilike.*${enc(w)}*`).join(",");
 
@@ -122,7 +122,17 @@ export function labelFact(f: FoundFact): string {
 // already saved when this runs, so the last 90 seconds are skipped. A message must
 // hit 2 specific words, or contain his single most specific word when that is 5+
 // letters (usually a name: "stephane", "patrice").
-export async function searchSaid(text: string, party = "jensen", k = 3): Promise<{ when: string; text: string }[]> {
+// One past message as the main model sees it. `ts` lets recall() merge and order
+// these with the memory judge's picks (memory-judge.ts).
+export function saidLine(r: { content: string; ts: number }): { when: string; text: string; ts: number } {
+  return {
+    when: new Date(Number(r.ts)).toLocaleDateString("en-GB", { timeZone: "Asia/Dubai", weekday: "short", day: "numeric", month: "short", year: "numeric" }),
+    text: String(r.content).replace(/\s+/g, " ").slice(0, 220),
+    ts: Number(r.ts),
+  };
+}
+
+export async function searchSaid(text: string, party = "jensen", k = 3): Promise<{ when: string; text: string; ts: number }[]> {
   const words = memoryKeywords(text);
   if (!words.length) return [];
   return withTimeout((async () => {
@@ -130,12 +140,8 @@ export async function searchSaid(text: string, party = "jensen", k = 3): Promise
       "chat_messages", ["content"], "content,ts", words,
       `party=eq.${enc(party)}&role=eq.user&ts=lt.${Date.now() - 90_000}&order=ts.desc&`, 100, (r) => `${r.ts}`,
     );
-    return pickSaid(rows, words, k)
-      .map((r) => ({
-        when: new Date(Number(r.ts)).toLocaleDateString("en-GB", { timeZone: "Asia/Dubai", weekday: "short", day: "numeric", month: "short", year: "numeric" }),
-        text: String(r.content).replace(/\s+/g, " ").slice(0, 220),
-      }));
-  })(), 2500, [] as { when: string; text: string }[]);
+    return pickSaid(rows, words, k).map(saidLine);
+  })(), 2500, [] as { when: string; text: string; ts: number }[]);
 }
 
 // The ranking behind searchSaid, pure so it can be tested without a database.

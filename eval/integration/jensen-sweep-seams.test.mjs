@@ -1255,6 +1255,18 @@ check("seam.112 reminders past his 24h window go as the approved template, logge
   return null;
 });
 
+check("seam.113 memory judge: meaning-based recall on real turns, ids only, fails soft to keyword (FM-45 follow-up)", () => {
+  const brain = read("lib/concierge/brain.ts");
+  const judge = read("lib/concierge/memory-judge.ts");
+  if (!brain.includes("opts?.party ? judgeSaid(q, opts.party, 4)")) return "recall() no longer asks the judge on a real turn (or asks it on name lookups)";
+  if (!brain.includes("mergeSaid(judged, kwSaid, 4)")) return "judge picks and keyword hits are no longer merged";
+  if (!judge.includes("pool.his.has(id)")) return "judge output is not restricted to ids of his lines that it was shown";
+  if (!judge.includes("keyword.filter((m) => m.ts < judged.coveredSince)")) return "keyword hits the judge already turned down can fill slots again";
+  if (!judge.includes(".catch(() => null)") || !judge.includes("withTimeout(")) return "a judge failure or timeout no longer falls back to keyword recall";
+  if (!/api\.anthropic\.com/.test(judge) || /openai/i.test(judge)) return "the judge must use the vetted Anthropic endpoint only (Law 3)";
+  return null;
+});
+
 check("seam.68 isOwner FAILS CLOSED when OWNER_WHATSAPP is empty (deny all, never allow-all) — FM-18 single-tenant breach", () => {
   const src = read("lib/whatsapp.ts");
   const i = src.indexOf("export function isOwner");
