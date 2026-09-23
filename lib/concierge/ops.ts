@@ -489,28 +489,25 @@ export async function chatPatchExternalId(rowId: number, externalId: string): Pr
     // never block delivery, never throw upstream
   }
 }
-// Automated pushes: mail alerts, briefs, evening checks, fallback lines. Measured on
-// 2026-09-23: ~155 of the bot's last 284 messages were these, and the window also
-// held audit rows, so "the last 12 messages" was often only 3 or 4 things Jensen
-// actually said. Reminders are NOT here: a bare "done" needs the last one.
-const AUTOMATED_PUSH = [
-  /^On this one I do not want to guess/,
-  /^I noticed a new email/,
-  /^Evening check,/,
-  /^Morning, Jensen/,
-  /^Tell me more so I can handle it/,
-  /^Let me get back to you on that in a moment/,
-  /^\(catching up while you were/,
+// Long automated pushes: the morning brief, the evening check and the mail-alert
+// header. Measured 2026-09-23: ~155 of the bot's last 284 messages were automated,
+// and the window also held audit rows, so "the last 12 messages" was often 3-4
+// things Jensen actually said. Nothing is DROPPED any more: a mail header pairs
+// with the "My draft reply" bubble after it, and "On this one I do not want to
+// guess" is a question he may answer hours later (review finding 5). Instead these
+// are SHORTENED so they cost little room, and the window is wider.
+const LONG_AUTOMATED = [
+  /^Morning, Jensen\. How's the head\?/,
+  /^Evening check, Jensen\./,
+  /^I noticed a new email that needs your eyes\./,
 ];
 export async function chatRecent(party = "jensen", limit = 12): Promise<{ role: "user" | "assistant"; content: string }[]> {
-  const rows = await sbSelect<any>("chat_messages", `party=eq.${enc(party)}&role=in.(user,assistant)&select=role,content,ts&order=ts.desc&limit=${limit * 4}`);
-  const chron = rows.reverse();
-  // Keep automated pushes only among the last 4 rows (he may be replying to the
-  // alert right above his message); older ones are dropped so real conversation
-  // fills the window.
-  const tailFrom = chron.length - 4;
-  const kept = chron.filter((r: any, i: number) => i >= tailFrom || !(r.role === "assistant" && AUTOMATED_PUSH.some((re) => re.test(String(r.content || "")))));
-  return kept.slice(-limit).map((r: any) => ({ role: r.role, content: r.content }));
+  const rows = await sbSelect<any>("chat_messages", `party=eq.${enc(party)}&role=in.(user,assistant)&select=role,content,ts&order=ts.desc&limit=${limit}`);
+  return rows.reverse().map((r: any) => {
+    const c = String(r.content || "");
+    const short = r.role === "assistant" && LONG_AUTOMATED.some((re) => re.test(c)) && c.length > 300;
+    return { role: r.role, content: short ? `${c.slice(0, 300)} [...]` : c };
+  });
 }
 // Admin-only: read Jensen's recent conversation (development access, one-way).
 export async function readOwnerChats(limit = 40): Promise<{ role: string; content: string; channel: string; ts: number }[]> {

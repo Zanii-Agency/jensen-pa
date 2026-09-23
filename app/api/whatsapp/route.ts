@@ -107,7 +107,7 @@ async function downloadMedia(mediaId: string): Promise<{ buf: Buffer; mime: stri
 
 async function recentHistory(party: string): Promise<{ role: "user" | "assistant"; content: string }[]> {
   try {
-    return await ops.chatRecent(party, 20);
+    return await ops.chatRecent(party, 30);
   } catch {
     return [];
   }

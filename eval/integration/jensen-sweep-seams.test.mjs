@@ -1118,35 +1118,43 @@ check("seam.108 no untrue claim words: 'cancelled' never stands for something th
   return null;
 });
 
-check("seam.109 memory searches the IMPORTANT WORDS, never his whole message as one substring (memory was off since June)", () => {
+check("seam.109 memory searches whole IMPORTANT words, labels email-sourced facts, uses the speaker's own messages, and never blocks a reply", () => {
   const b = read("lib/concierge/brain.ts");
   const r = b.slice(b.indexOf("export async function recall"), b.indexOf("const SALIENCE_SYS"));
   if (/ilike\.\*\$\{enc\(q\)\}\*/.test(r)) return "recall searches for the whole message again (matches almost nothing)";
-  if (!/searchFacts\(q/.test(r) || !/searchDocs\(q/.test(r) || !/searchSaid\(q/.test(r)) return "recall does not use the keyword memory search";
+  if (!/searchSaid\(q, opts\?\.party \|\| "jensen"/.test(r)) return "on a developer turn, Jensen's words would be shown as the developer's";
   if (!/tryEmbed\(q\)/.test(r)) return "the embedding path is gone; adding a key later would not switch smart search back on";
   const m = read("lib/concierge/memory-search.ts");
-  if (!/ts=lt\.\$\{before\}/.test(m)) return "his own current message can match itself as a memory";
+  if (!/\(\^\|\[\^a-z0-9\]\)\$\{w\}/.test(m)) return "matching is substring again ('road' would hit 'abroad')";
+  if (!/unverified\]/.test(m)) return "a third party's email can be presented as something he said";
+  if (!/withTimeout\(/.test(m)) return "a slow memory query can block the reply";
+  if (!/ts=lt\.\$\{Date\.now\(\) - 90_000\}/.test(m)) return "his current message can match itself";
+  if (!/and=\(\$\{ilikes\(c, specific\.slice\(0, 2\)\)\}\)/.test(m)) return "no precise two-word pass; relevant rows get crowded out as data grows";
   return null;
 });
 
-check("seam.110 the bot sees what he told it before, and the next 7 days, every turn", () => {
+check("seam.110 old memories never override the current plan: newest wins, calendar wins, and asking 'which one' is allowed", () => {
   const loop = read("lib/concierge/loop.ts");
-  if (!/THINGS HE TOLD YOU BEFORE/.test(loop)) return "his own earlier words never reach the prompt";
-  if (!/COMING UP \(next 7 days/.test(loop)) return "only today's calendar is visible (the road-test miss)";
-  if (!/never call one "a default"/.test(loop)) return "the prompt does not stop the bot doubting times he gave";
-  if (/every event you mention by name in this turn MUST appear in TODAY'S CALENDAR/.test(loop)) return "the calendar wall still forbids mentioning any non-today event";
+  const said = loop.slice(loop.indexOf("THINGS HE SAID BEFORE"), loop.indexOf("${saidText}", loop.indexOf("THINGS HE SAID BEFORE")));
+  if (!said) return "his earlier words never reach the prompt";
+  if (/never ask him to repeat them/.test(said) || /never call them a guess/.test(said)) return "old memories are presented as unquestionable (review blocker: a changed time would be asserted as the old one)";
+  if (!/override an older line/.test(said) || !/go with the newest/.test(said)) return "a newer message or the calendar does not override an older memory";
+  if (!/relative to THAT line's date/.test(said)) return "'tomorrow' inside an old line would be read as tomorrow from today";
+  if (!/asking which one is required/.test(said)) return "the bot is discouraged from asking which Sara / which workshop";
+  if (!/COMING UP \(next 7 days/.test(loop)) return "only today's calendar is visible";
+  if (/Naming an event that is not in TODAY'S CALENDAR is a hallucination/.test(loop)) return "the calendar wall still forbids mentioning any non-today event";
+  if (!/todayEvents, contacts, upcoming\] = await Promise\.all/.test(loop)) return "the 7-day calendar is a serial extra round trip on every reply";
   return null;
 });
 
-check("seam.111 the history window is his conversation, not audit rows and mail alerts", () => {
+check("seam.111 the history window keeps his whole conversation: audit rows out, long automated pushes shortened, nothing that pairs with a draft dropped", () => {
   const ops = read("lib/concierge/ops.ts");
-  const c = ops.slice(ops.indexOf("export async function chatRecent"), ops.indexOf("export async function readOwnerChats"));
+  const c = ops.slice(ops.indexOf("const LONG_AUTOMATED"), ops.indexOf("export async function readOwnerChats"));
   if (!/role=in\.\(user,assistant\)/.test(c)) return "audit/system rows still eat the history window";
-  if (!/AUTOMATED_PUSH\.some/.test(c)) return "old mail alerts and briefs still fill the window";
-  if (!/i >= tailFrom/.test(c)) return "the alert he is replying to right now would be dropped too";
-  const pre = ops.slice(ops.indexOf("const AUTOMATED_PUSH"), ops.indexOf("export async function chatRecent"));
-  if (/Reminder/.test(pre)) return "reminders are filtered out, so a bare 'done' loses its anchor";
-  if (!/chatRecent\(party, 20\)/.test(read("app/api/whatsapp/route.ts"))) return "the webhook still passes only 12 messages";
+  if (/\.filter\(/.test(c.slice(c.indexOf("export async function chatRecent")))) return "the window drops messages again (a mail header would lose its draft, or a pending question would vanish)";
+  if (/On this one I do not want to guess/.test(c.slice(0, c.indexOf("export async function chatRecent")))) return "the 'do not want to guess' question is treated as noise; he may answer it hours later";
+  if (!c.includes("Morning, Jensen\\. How's the head")) return "a normal reply that starts 'Morning, Jensen' could be shortened as if it were the brief";
+  if (!/chatRecent\(party, 30\)/.test(read("app/api/whatsapp/route.ts"))) return "the webhook window is not widened";
   return null;
 });
 
@@ -1290,7 +1298,7 @@ check("seam.72 recall() keyword-searches the docs TABLE (title or content) so co
   // important WORDS instead of the whole message (which matched almost nothing).
   const m = read("lib/concierge/memory-search.ts");
   const d = m.slice(m.indexOf("export async function searchDocs"));
-  if (!/"docs",\s*`or=\(\$\{anyOf\("title", words\)\},\$\{anyOf\("content", words\)\}\)/.test(d)) return "the docs table is not keyword-searched on BOTH title and content";
+  if (!d.includes('"docs", ["title", "content"]')) return "the docs table is not keyword-searched on BOTH title and content";
   const br = read("lib/concierge/brain.ts");
   const rc = br.slice(br.indexOf("export async function recall"));
   if (!/searchDocs\(q, 10\)/.test(rc)) return "recall does not call the docs-table search";

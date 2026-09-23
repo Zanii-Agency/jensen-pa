@@ -116,7 +116,7 @@ function rrf<T>(lists: T[][], key: (t: T) => string): T[] {
 // said: his own past messages matching this one, dated (see memory-search.ts).
 export type Recall = { facts: string[]; docs: { title: string; text: string }[]; said: { when: string; text: string }[] };
 
-export async function recall(query: string, opts?: { factK?: number; docK?: number }): Promise<Recall> {
+export async function recall(query: string, opts?: { factK?: number; docK?: number; party?: string }): Promise<Recall> {
   const factK = opts?.factK ?? 6;
   const docK = opts?.docK ?? 5;
   const q = (query || "").trim();
@@ -129,7 +129,9 @@ export async function recall(query: string, opts?: { factK?: number; docK?: numb
     tryEmbed(q),
     factK ? searchFacts(q, 10) : Promise.resolve([] as string[]),
     docK ? searchDocs(q, 10) : Promise.resolve([] as { title: string; content: string }[]),
-    searchSaid(q, "jensen", 3).catch(() => [] as { when: string; text: string }[]),
+    // The SPEAKER's own past words: on a developer turn, Jensen's messages must not
+    // be presented as things the developer said (review, finding 9).
+    searchSaid(q, opts?.party || "jensen", 3).catch(() => [] as { when: string; text: string }[]),
   ]);
 
   // FACTS
