@@ -44,6 +44,19 @@ export async function sbUpdate(table: string, qs: string, patch: any): Promise<v
   });
   if (!r.ok) throw new Error(`${table} update ${r.status}: ${(await r.text()).slice(0, 200)}`);
 }
+// PATCH that reports which rows it actually changed. The confirm layer uses this
+// as an atomic claim: a PATCH filtered on status=pending returns the row only to
+// the one caller whose UPDATE matched, so two racing confirmations can never both
+// execute. (Proven live on 2026-09-23: two concurrent claims, exactly one won.)
+export async function sbUpdateReturning<T = any>(table: string, qs: string, patch: any): Promise<T[]> {
+  const r = await fetch(`${base()}/${table}?${qs}`, {
+    method: "PATCH",
+    headers: headers({ Prefer: "return=representation" }),
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) throw new Error(`${table} update ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
 export async function sbDelete(table: string, qs: string): Promise<void> {
   const r = await fetch(`${base()}/${table}?${qs}`, { method: "DELETE", headers: headers() });
   if (!r.ok) throw new Error(`${table} delete ${r.status}: ${(await r.text()).slice(0, 200)}`);

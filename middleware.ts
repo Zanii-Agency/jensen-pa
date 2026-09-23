@@ -8,7 +8,9 @@ import { COOKIE, verifyToken } from "@/lib/auth";
 // session can never satisfy a bearer client), so it must bypass the cookie/maintenance wall.
 // /api/peer is the cross-bot task bridge (ADR-0015): HMAC-gated in its own handler
 // and default-OFF, so it bypasses the cookie/maintenance wall like the other webhooks.
-const EXTERNAL = ["/api/whatsapp", "/api/cron", "/api/shopify/webhook", "/api/ingest", "/api/digital-u", "/api/mute", "/api/actions", "/api/peer"];
+// /api/health is the read-only monitor surface: its own dedicated bearer token,
+// fails closed when unset, returns counts only (never message bodies).
+const EXTERNAL = ["/api/whatsapp", "/api/cron", "/api/shopify/webhook", "/api/ingest", "/api/digital-u", "/api/mute", "/api/actions", "/api/peer", "/api/health"];
 
 // The session-login flow's own routes — public for the auth gate, but during
 // maintenance they are also walled (don't let anyone log in while we are dark).
