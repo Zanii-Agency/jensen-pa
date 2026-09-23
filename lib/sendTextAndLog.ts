@@ -11,11 +11,12 @@
 // reaskPhrase and the catch is logged for engineering review. The wall is
 // in code; the rules are in lib/bot/guards-config.ts.
 
-import { sendWhatsApp, sendWhatsAppRaw, sendWhatsAppInteractive, devPhone } from "@/lib/whatsapp";
+import { sendWhatsApp, sendWhatsAppRaw, sendWhatsAppInteractive, sendWhatsAppTemplate, devPhone } from "@/lib/whatsapp";
 import { admin } from "@/lib/db";
 import { sanitizeReply } from "@/lib/bot-guards/index.js";
 import { JENSEN_BOT_GUARDS_CONFIG } from "@/lib/bot/guards-config";
 import { mirrorToChatwoot } from "@/lib/chatwoot-mirror";
+import { deliveryFailedAudit } from "@/lib/concierge/wa-delivery.mjs";
 
 // Law 10 (test-mode) branch: opts.dev === true reroutes the message to the
 // developer phone and SKIPS chat_messages + audit inserts. Test traffic never
@@ -130,4 +131,55 @@ export async function sendButtonsAndLog(
     try { await admin().from("chat_messages").update({ external_id: r.wamid }).eq("id", rowId); } catch { /* best effort */ }
   }
   return { ok: true };
+}
+
+// The chokepoint for approved templates: the only messages Meta delivers more than
+// 24h after his last message (FM-21). `text` is the template body with its
+// parameters filled in, i.e. exactly what he reads; that is what the transcript
+// records. The wall runs on it like any other message: if it would drop, nothing
+// is sent here and the caller falls back to sendTextAndLog, which pages the
+// developer. Law 10: dev sends go to the developer phone and are not logged.
+export async function sendTemplateAndLog(
+  to: string,
+  name: string,
+  lang: string,
+  params: string[],
+  text: string,
+  opts?: { force?: boolean; party?: string; dev?: boolean },
+): Promise<{ ok: boolean; dropped?: boolean }> {
+  if (sanitizeReply(text, JENSEN_BOT_GUARDS_CONFIG).dropped) return { ok: false, dropped: true };
+  if (opts?.dev) {
+    const target = devPhone();
+    if (!target) return { ok: false };
+    return { ok: !!(await sendWhatsAppTemplate(target, name, lang, params, { force: true })) };
+  }
+  const ins = await admin().from("chat_messages").insert({
+    role: "assistant",
+    content: text,
+    channel: "whatsapp",
+    party: opts?.party ?? "jensen",
+    ts: Date.now(),
+  }).select("id").single();
+  const rowId: number | null = (ins?.data as any)?.id ?? null;
+  mirrorToChatwoot("outgoing", to, text).catch(() => {});
+  const wamid = await sendWhatsAppTemplate(to, name, lang, params, { force: opts?.force, mirror: text });
+  if (rowId != null) {
+    try {
+      await admin().from("chat_messages")
+        .update(wamid ? { external_id: wamid } : { content: `${text}\n[template NOT sent]` })
+        .eq("id", rowId);
+    } catch { /* best effort */ }
+  }
+  if (!wamid) {
+    // Not silent: counted by /api/health/wall-drops, and the developer is paged.
+    try {
+      await admin().from("chat_messages").insert({
+        role: "system", channel: "audit", party: opts?.party ?? "jensen", ts: Date.now(),
+        content: deliveryFailedAudit({ wamid: "none", error: `template ${name} not sent` }, { content: text }),
+      });
+    } catch { /* best effort */ }
+    const dev = devPhone();
+    if (dev) sendWhatsAppRaw(dev, `[Dorje] template ${name} was not sent to the client. It said: ${text.slice(0, 300)}`, { force: true }).catch(() => {});
+  }
+  return { ok: !!wamid };
 }

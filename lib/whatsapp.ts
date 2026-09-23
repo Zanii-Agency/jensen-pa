@@ -213,10 +213,16 @@ export async function sendWhatsAppTemplate(
   name: string,
   lang: string,
   body: string[] = [],
-  opts?: { force?: boolean }
+  opts?: { force?: boolean; mirror?: string }
 ): Promise<string | null> {
   if (!waConfigured()) return null;
   if (!passesTrainingGate(to, `template:${name}`, opts)) return null;
+  // The mute kill switch covers templates too (it used to stop only text and
+  // buttons, so a muted bot still sent every off-window template).
+  try {
+    const { kvGet } = await import("@/lib/db");
+    if (await kvGet("bot_muted", false)) return null;
+  } catch { /* fail open, as the text sender does */ }
   const components = body.length
     ? [{ type: "body", parameters: body.map((v) => ({ type: "text", text: stripDashes(String(v || "")) })) }]
     : undefined;
@@ -231,6 +237,8 @@ export async function sendWhatsAppTemplate(
         template: { name, language: { code: lang }, ...(components ? { components } : {}) },
       }),
     });
+    // The operator sees templates like any other outbound (FM-21 review).
+    mirrorToOperator(opts?.mirror || `[template ${name}] ${body.join(" | ")}`, "out", "", to).catch(() => {});
     if (!res.ok) {
       console.log(`[wa-template] ${name} → ${to.replace(/[^0-9]/g, "").slice(-4)} failed: ${res.status} ${(await res.text()).slice(0, 240)}`);
       return null;

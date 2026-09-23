@@ -4,7 +4,8 @@ import { sbSelect } from "@/lib/concierge/rest";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// How many client-facing replies did the send wall kill recently? (FM-43)
+// How many client-facing messages failed to reach him recently? Replies the send
+// wall killed (FM-43), plus messages Meta accepted but reported as failed (FM-21).
 //
 // An external monitor needs this number every few minutes. It replaces the
 // `wall_drops` database view from PR #7, which needed DDL on Jensen's Supabase
@@ -26,13 +27,14 @@ export async function GET(req: NextRequest) {
   try {
     const rows = await sbSelect<{ content: string }>(
       "chat_messages",
-      `select=content&channel=eq.audit&content=like.pre_send_caught*&ts=gte.${since}&limit=500`,
+      `select=content&channel=eq.audit&or=(content.like.pre_send_caught*,content.like.delivery_failed*)&ts=gte.${since}&limit=500`,
     );
     const guards: Record<string, number> = {};
     for (const r of rows) {
       // "pre_send_caught[...]: forbidden_brand:zanii | <body>" -> "forbidden_brand:zanii".
       // Only this label is kept; the body after the pipe is discarded right here.
-      const g = /pre_send_caught[^:]*:\s*([a-z_]+:[A-Za-z_]+)/.exec(r.content)?.[1] ?? "unknown";
+      const g = r.content.startsWith("delivery_failed") ? "delivery_failed"
+        : /pre_send_caught[^:]*:\s*([a-z_]+:[A-Za-z_]+)/.exec(r.content)?.[1] ?? "unknown";
       guards[g] = (guards[g] ?? 0) + 1;
     }
     return NextResponse.json({ ok: true, minutes, count: rows.length, guards });

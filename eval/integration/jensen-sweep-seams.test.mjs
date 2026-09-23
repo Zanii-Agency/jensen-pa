@@ -194,8 +194,11 @@ check("seam.33 chatAppend idempotent on external_id (no double-save)", () => {
 });
 
 check("seam.34 reminder surfaces the meeting link at reminder time", () => {
+  // FM-21 moved the wording into reminder-plan.ts (window-aware); the link rides the text path.
   const src = read("app/api/cron/reminders/route.ts");
-  if (!/ev\.meeting_url/.test(src)) return "reminder body does not include the meeting link";
+  const plan = read("lib/concierge/reminder-plan.ts");
+  if (!src.includes("reminderPlan(ev, win)")) return "reminder cron no longer builds its message with reminderPlan";
+  if (!/ev\.meeting_url/.test(plan)) return "reminder body does not include the meeting link";
   return null;
 });
 
@@ -946,7 +949,8 @@ check("seam.95 a bare 'done' closes the reminder just sent ONLY when that is una
   if (!/\.then\(\(\) => true, \(\) => false\)/.test(block)) return "a failed completion can still reply 'Done'";
   const h = src.slice(src.indexOf("async function pingedJustNow"), src.indexOf("async function sendConfirmButtons"));
   if (!/reminded_at=gte\./.test(h) || !/outcome=is\.null/.test(h)) return "the anchor does not read a recent, unconcluded ping";
-  if (!/startsWith\(`Reminder\. \$\{ev\.title\} at`\)/.test(h)) return "the reminder need not be the LAST thing he was sent; his 'done' may answer something newer";
+  // FM-21: both sides use reminderTitle() so untidy titles still match.
+  if (!/startsWith\(`Reminder\. \$\{reminderTitle\(ev\.title\)\} at`\)/.test(h)) return "the reminder need not be the LAST thing he was sent; his 'done' may answer something newer";
   if (!h.includes("\\(reminder \\d+\\)") || !/reminded_at=is\.null/.test(h)) return "a reminder SERIES is closed one row at a time while the rest keep firing";
   return null;
 });
@@ -1214,7 +1218,8 @@ check("seam.66 CHARACTERIZATION: reminder cron still fires due events at T-5 + l
   if (!/delta >= LEAD_MIN - WINDOW && delta <= LEAD_MIN \+ WINDOW/.test(src)) return "cron no longer uses the [4,6]-min lead window";
   if (!/\/\^Reminder:\/i\.test\(ev\.title\)/.test(src)) return "cron no longer skips legacy 'Reminder:' rows";
   const latchIdx = src.indexOf("reminded_at: Date.now()");
-  const sendIdx = src.indexOf("sendTextAndLog(num, body");
+  const sends = ["sendTemplateAndLog(num", "sendTextAndLog(num"].map((t) => src.indexOf(t)).filter((i) => i >= 0);
+  const sendIdx = sends.length ? Math.min(...sends) : -1;
   if (latchIdx < 0 || sendIdx < 0 || latchIdx > sendIdx) return "cron no longer latches reminded_at BEFORE send (at-most-once broken)";
   return null;
 });
@@ -1222,6 +1227,31 @@ check("seam.66 CHARACTERIZATION: reminder cron still fires due events at T-5 + l
 check("seam.67 reminder cron does NOT fire for completed events (outcome filter) — FM-23 / FM-09 reborn", () => {
   const src = read("app/api/cron/reminders/route.ts");
   if (!/outcome=is\.null/.test(src)) return "cron select missing outcome=is.null — fires reminders for events Jensen already marked done";
+  return null;
+});
+
+check("seam.112 reminders past his 24h window go as the approved template, logged, failures visible (FM-21)", () => {
+  const src = read("app/api/cron/reminders/route.ts");
+  const chk = read("lib/sendTextAndLog.ts");
+  const hook = read("app/api/whatsapp/route.ts");
+  const health = read("app/api/health/wall-drops/route.ts");
+  if (!src.includes('isInWindow("jensen")')) return "reminder cron no longer checks the 24h window";
+  if (!src.includes("sendTemplateAndLog(num, REMINDER_TEMPLATE")) return "off-window reminders no longer use the template";
+  if (!/export async function sendTemplateAndLog/.test(chk)) return "template sender left the Law 2 chokepoint";
+  const t = chk.slice(chk.indexOf("export async function sendTemplateAndLog"));
+  if (t.indexOf(".insert(") < 0 || t.indexOf(".insert(") > t.indexOf("await sendWhatsAppTemplate(to")) return "template is not logged BEFORE it is sent (Law 2)";
+  if (!/sanitizeReply\(text/.test(t)) return "template text skips the send wall";
+  if (!hook.includes('s.status === "failed"') || !hook.includes("deliveryFailedAudit(s, r)")) return "Meta 'failed' reports are discarded again";
+  if (!health.includes("content.like.delivery_failed*")) return "health endpoint no longer counts failed deliveries";
+  // PR #12 review: mute covers templates; no undeliverable free text after a refused
+  // template; the latch is claimed once even if two cron runs overlap.
+  const wa = read("lib/whatsapp.ts");
+  const tpl = wa.slice(wa.indexOf("export async function sendWhatsAppTemplate"), wa.indexOf("export async function sendWhatsAppDocument"));
+  if (!tpl.includes('kvGet("bot_muted"')) return "the mute switch no longer stops templates";
+  if (!tpl.includes("mirrorToOperator(")) return "templates are hidden from the operator mirror";
+  if (!src.includes("!r.dropped && !win.open")) return "a refused template off-window falls back to free text Meta will never deliver";
+  if (!src.includes("reminded_at=is.null`, { reminded_at")) return "the reminder latch is not guarded (two cron runs can both send)";
+  if (!hook.includes("reminderTitle(ev.title)")) return "'done' no longer matches the title the reminder showed";
   return null;
 });
 

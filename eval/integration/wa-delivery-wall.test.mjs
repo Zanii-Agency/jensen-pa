@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldApplyStatus, parseStatuses, STATUS_RANK } from "../../lib/concierge/wa-delivery.mjs";
+import { shouldApplyStatus, parseStatuses, STATUS_RANK, deliveryFailedAudit } from "../../lib/concierge/wa-delivery.mjs";
 
 test("lifecycle only advances, never downgrades", () => {
   assert.equal(shouldApplyStatus(null, "sent"), true);
@@ -53,4 +53,15 @@ test("a webhook with no statuses array yields nothing (it is an inbound, not a s
   assert.equal(parseStatuses({ messages: [{ id: "x", from: "971" }] }).length, 0);
   assert.equal(parseStatuses(undefined).length, 0);
   assert.equal(parseStatuses({}).length, 0);
+});
+
+// FM-21: the delivery_* columns never existed, so a "failed" report is kept as an
+// audit row the health endpoint counts. The label must be the prefix it counts.
+test("a failed delivery becomes an audit line the health endpoint can count", () => {
+  const line = deliveryFailedAudit(
+    { wamid: "wamid.X", status: "failed", error: "Re-engagement message" },
+    { content: "Reminder. Meeting with Prateek at 19:00." },
+  );
+  assert.ok(line.startsWith("delivery_failed: Re-engagement message | wamid=wamid.X | Reminder. Meeting"));
+  assert.ok(deliveryFailedAudit({ wamid: "w", status: "failed", error: null }, null).startsWith("delivery_failed: unknown"));
 });
