@@ -117,7 +117,13 @@ export const JENSEN_BOT_GUARDS_CONFIG = defineBotConfig({
 
   pendingKinds: ['mail_draft_confirming', 'calendar_clarifying'],
 
-  reaskPhrase: 'Tell me more so I can handle it.',
+  // What Jensen receives when a reply is killed. It WAS 'Tell me more so I can
+  // handle it.', and the scheduled senders (08:00 brief, reminders, mail alerts)
+  // delivered it raw: on 17-22 Sep his entire morning brief was that one line, six
+  // days running. KT #338 already ruled the cryptic phrase must never reach him;
+  // only one of the two send paths honoured it. Fixed at the source so every path
+  // does. The full original goes to the developer (sendTextAndLog / sendWhatsApp).
+  reaskPhrase: 'Let me get back to you on that in a moment.',
 
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
 })

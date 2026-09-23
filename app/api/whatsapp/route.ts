@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { sendWhatsApp, isOwner, whoIs, mirrorInbound } from "@/lib/whatsapp";
-import { sendTextAndLog } from "@/lib/sendTextAndLog";
+import { sendTextAndLog, sendButtonsAndLog } from "@/lib/sendTextAndLog";
 import { runConcierge } from "@/lib/concierge/loop";
-import { sendFiledDocument } from "@/lib/concierge/dispatch";
+import { sendFiledDocument, executePending } from "@/lib/concierge/dispatch";
+import { claimByTap, cancelPending, holdStatus } from "@/lib/concierge/pending-actions";
 import { kvGet, kvSet, admin } from "@/lib/db";
 import * as ops from "@/lib/concierge/ops";
 import { classifyAndFile } from "@/lib/concierge/intake";
@@ -110,6 +111,68 @@ async function recentHistory(party: string): Promise<{ role: "user" | "assistant
   } catch {
     return [];
   }
+}
+
+// The event Jensen was most recently pinged about, if his "done" can only mean it.
+// Null (so the brain resolves it from the thread) when:
+//  - no reminder fired in the last 3 hours;
+//  - that reminder is not the LAST thing he was sent (he may be answering
+//    something newer: review 3, finding 4);
+//  - it is part of a series with more pings still to come ("done" could mean this
+//    one or all of them; the DJ chase was titled "... (reminder 2)", "(reminder 4)").
+async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
+  const since = Date.now() - 3 * 3_600_000;
+  const rows = await sbSelect<{ id: string; title: string; reminded_at: number; date: string; recurrence: string | null }>(
+    "events",
+    `select=id,title,reminded_at,date,recurrence&reminded_at=gte.${since}&outcome=is.null&order=reminded_at.desc&limit=1`,
+  );
+  const ev = rows?.[0];
+  if (!ev) return null;
+  const last = await sbSelect<{ content: string }>(
+    "chat_messages",
+    `select=content&party=eq.jensen&role=eq.assistant&channel=eq.whatsapp&order=ts.desc&limit=1`,
+  );
+  if (!String(last?.[0]?.content || "").startsWith(`Reminder. ${ev.title} at`)) return null;
+  // A RECURRING event (weekly/monthly/yearly) gets its next occurrence created as a
+  // new row the moment it fires. That row is next week's reminder, not "the rest of
+  // a series still firing", so "done" closes this occurrence only (review 4, #3).
+  if ((ev as any).recurrence) return { id: ev.id, title: ev.title };
+  // One-off pings for the same thing still to come (the DJ chase: "Send payment
+  // for DJ", "(reminder 2)", "(reminder 4)"; or "remind me Mon, Tue, Wed") ARE a
+  // series: "done" could mean this one or all of them, so the brain asks.
+  const base = ev.title.replace(/\s*\(reminder \d+\)\s*$/i, "").trim();
+  const more = await sbSelect<{ id: string }>(
+    "events",
+    `select=id&title=ilike.${enc(base + "*")}&reminded_at=is.null&outcome=is.null&date=gte.${enc((ev as any).date)}&id=neq.${enc(ev.id)}&limit=1`,
+  );
+  if (more.length) return null;
+  return { id: ev.id, title: ev.title };
+}
+
+// A held destructive action, sent as Yes / No buttons. WhatsApp caps an
+// interactive body at 1024 chars, so a longer question (a full email body, a long
+// list) goes first as a normal message and the buttons refer to it.
+//
+// A Yes button must never sit under a question he did not actually receive (review
+// 4 blocker): if the long text was walled or failed, or the buttons themselves did
+// not go out, the held action is cancelled and he is told plainly that nothing
+// will happen.
+async function sendConfirmButtons(to: string, held: { id: string; echo: string }, party: string): Promise<void> {
+  const giveUp = async () => {
+    await cancelPending(held.id);
+    await sendTextAndLog(to, "I couldn't show you that confirmation properly, so nothing will happen. Ask me again.", { party }).catch(() => {});
+  };
+  let body = held.echo;
+  if (body.length > 1000) {
+    const shown = await sendTextAndLog(to, body, { party }).catch(() => ({ ok: false, dropped: false }));
+    if (!shown.ok || shown.dropped) return giveUp();
+    body = "Confirm what I just sent above?";
+  }
+  const sent = await sendButtonsAndLog(to, body, [
+    { id: `pa:${held.id}:yes`, title: "Yes" },
+    { id: `pa:${held.id}:no`, title: "No, keep it" },
+  ], { party }).catch(() => ({ ok: false }));
+  if (!sent.ok) return giveUp();
 }
 
 export async function POST(req: NextRequest) {
@@ -250,6 +313,41 @@ export async function POST(req: NextRequest) {
     }
 
     const sender = whoIs(from);
+
+    // CONFIRMATION TAP (ADR-0002 Phase 1, v4). The ONLY way a held destructive
+    // action runs on WhatsApp. The button id names the exact held action, so this
+    // is not a guess about what a typed "yes" meant. Handled before the coalescer
+    // and the brain so nothing can reinterpret it.
+    const tapId = msg.type === "interactive" && msg.interactive?.type === "button_reply" ? String(msg.interactive.button_reply?.id || "") : "";
+    const tap = /^pa:([0-9a-f-]{36}):(yes|no)$/i.exec(tapId);
+    if (tap) {
+      const tapParty = sender.role !== "owner" ? "taona" : "jensen";
+      const [, holdId, choice] = tap;
+      await ops.chatAppend("user", `[tapped: ${choice.toLowerCase() === "yes" ? "Yes" : "No, keep it"}]`, "whatsapp", tapParty, { externalId: inboundWamid }).catch(() => {});
+      // What a tap on a button that can no longer run says, read from the record.
+      const why = (h: Awaited<ReturnType<typeof holdStatus>>): string =>
+        !h || h.party !== tapParty ? "I can't find that request any more. Ask me again."
+        : h.status === "confirmed" && Date.now() - new Date(h.confirmed_at || h.created_at).getTime() < 2 * 60_000 ? "Still working on that one."
+        : h.status === "confirmed" ? "I couldn't confirm whether that went through. Check before asking me again."
+        : h.status === "executed" && h.error ? "That did not go through last time. Ask me again and I'll retry."
+        : h.status === "executed" ? "That was already done."
+        : h.status === "cancelled" ? "That one was cancelled. Ask me again if you still want it."
+        : "That request expired. Ask me again and I'll set it up fresh.";
+      let out: string;
+      if (choice.toLowerCase() === "no") {
+        const h = await holdStatus(holdId);
+        if (h && h.status === "pending" && h.party === tapParty) { await cancelPending(holdId); out = "Left it as it is."; }
+        else out = why(h);
+      } else {
+        const claimed = await claimByTap(holdId, tapParty, inboundWamid || `tap:${Date.now()}`);
+        out = claimed
+          ? (await executePending(claimed, { party: tapParty, inboundId: inboundWamid })).outcome
+          : why(await holdStatus(holdId));
+      }
+      await sendTextAndLog(from, out, { party: tapParty });
+      return NextResponse.json({ ok: true });
+    }
+
     // OPERATOR MIRROR (silent, never shown to the sender). Forward Jensen's inbound
     // to Taona's number so he can live-tail conversations. Only the principal's
     // (owner's) inbound is mirrored; the operator's own messages are never echoed
@@ -280,8 +378,9 @@ export async function POST(req: NextRequest) {
       const party = sender.role !== "owner" ? "taona" : "jensen";
       // Persist with a [voice note] marker so chat history shows it came as audio.
       await ops.chatAppend("user", `[voice note] ${transcript}`, "whatsapp", party, { externalId: inboundWamid }).catch(() => {});
-      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: transcript }], channel: "whatsapp", sender, inboundId: inboundWamid });
-      await sendWhatsApp(from, reply || "I'm here.");
+      const { reply, held } = await runConcierge({ messages: [...history, { role: "user", content: transcript }], channel: "whatsapp", sender, inboundId: inboundWamid });
+      if (reply?.trim() || !held) await sendWhatsApp(from, reply || "I'm here.");
+      if (held) await sendConfirmButtons(from, held, party);
       return NextResponse.json({ ok: true });
     }
 
@@ -537,28 +636,35 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // FM-11 DETERMINISTIC DONE-RESOLUTION. Bare confirmations from JENSEN
-    // (owner tier only) route the most recently created open task to done
-    // WITHOUT model dispatch. KT #127: when the model is brittle for a
-    // deterministic verb, code the verb. Owner-only because Taona (admin)
-    // chatting "Done" must NOT mark Jensen's tasks complete. Strip the
-    // harness tag before matching so the prod harness exercises this path.
-    // Wall 1 carve-out (2026-06-16): a swipe-anchor on the same turn means
-    // Jensen pointed at a specific message, so the LLM brain steers better
-    // than open[0]; fall through to runConcierge in that case.
+    // FM-11 DETERMINISTIC DONE-RESOLUTION, v2 (2026-09-23).
+    //
+    // A bare "done" answers the thing I JUST pinged him about. v1 marked "the most
+    // recently CREATED open task" complete, which is an unrelated row: on 21 Sep he
+    // got "Reminder. Meeting with Marisa Peers at 16:30", replied "done", and v1
+    // closed "Message Stéphane" (created that morning) -- the one reminder he had
+    // said he still wanted. It then could never fire.
+    //
+    // v2 anchors to the calendar event whose reminder fired most recently (the
+    // reminder cron stamps reminded_at). If there is no recent ping, or two pings
+    // are too close to tell apart, it does NOT guess: it falls through to the
+    // brain, which can see the thread and ask. A matcher that cannot find the
+    // intended row must say so, never fall through to a weaker match.
+    //
+    // Owner-only: Taona (admin) chatting "Done" must NOT close Jensen's items. A
+    // swipe-anchor means he pointed at a specific message, so the brain resolves it.
     const cleaned = text.replace(/^\s*\[H[a-z0-9]{6,}\]\s*/, "").trim();
     const doneEligible = sender.role === "owner" || process.env.JENSEN_MODE === "TRAINING";
     if (doneEligible && !swipeAnchor && /^(done|done\.|did it|yes done|handled|marked done)$/i.test(cleaned)) {
-      const open = await ops.listTasks({ done: false }).catch(() => [] as any[]);
-      if (open.length > 0) {
-        await ops.updateTask({ id: open[0].id, done: true }).catch(() => {});
+      const target = await pingedJustNow().catch(() => null);
+      const closed = target ? await ops.completeEvent({ id: target.id }).then(() => true, () => false) : false;
+      if (target && closed) {
         await ops.chatAppend("user", text, "whatsapp", "jensen", { externalId: inboundWamid }).catch(() => {});
-        const reply = `Done. Marked "${open[0].title}" complete.`;
+        const reply = `Done. Marked "${target.title}" complete.`;
         await ops.chatAppend("assistant", reply, "whatsapp", "jensen").catch(() => {});
         await sendWhatsApp(from, reply);
         return NextResponse.json({ ok: true });
       }
-      // No open tasks: fall through to the brain so Jensen gets a graceful reply.
+      // No single recent ping to anchor to: the brain resolves it from the thread.
     }
 
     // DETERMINISTIC FILE-SEND-BACK (KT #206561, same principle as FM-11 above:
@@ -614,8 +720,9 @@ export async function POST(req: NextRequest) {
     // log the error to the audit channel so the operator sees it. The inbound
     // is already persisted above (NO-CHAT-LOST), so nothing is lost either way.
     try {
-      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: turnInput }], channel: "whatsapp", sender, swipeAnchor, inboundId: inboundWamid });
-      await sendWhatsApp(from, reply || "I'm here.");
+      const { reply, held } = await runConcierge({ messages: [...history, { role: "user", content: turnInput }], channel: "whatsapp", sender, swipeAnchor, inboundId: inboundWamid });
+      if (reply?.trim() || !held) await sendWhatsApp(from, reply || "I'm here.");
+      if (held) await sendConfirmButtons(from, held, inboundParty);
     } catch (brainErr: any) {
       await sendWhatsApp(
         from,

@@ -1,32 +1,61 @@
 // Live end-to-end check of the confirm layer against the REAL kv table.
 //   set -a && . ./.env.prod && set +a && npx tsx scripts/_test-confirm-layer-live.mts
 //
-// Uses the scratch party "selftest". The confirm-router only ever looks up
-// "jensen" / "taona", so nothing here can reach Jensen or execute anything.
-// Every row it writes is deleted at the end. Exits non-zero on any failure.
-import { proposePending, findOpenPending, confirmAndClaim, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
-import { sbSelect, sbDelete } from "../lib/concierge/rest";
+// Uses the scratch party "selftest". Nothing here can reach Jensen or execute a
+// tool: it only exercises the hold / claim / cancel records. Every row it writes
+// is deleted at the end. Exits non-zero on any failure.
+import { proposePending, findOpenHold, claimByTap, holdStatus, recentlyExecutedSame, lastExecuted, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
+import { sbSelect, sbUpdate, sbDelete } from "../lib/concierge/rest";
 
 const P = "selftest";
 const scratch = "key=like." + encodeURIComponent(`pending_action:${P}:*`);
 let failed = 0;
 const ok = (c: boolean, m: string) => { console.log((c ? "PASS " : "FAIL ") + m); if (!c) failed++; };
+const hold = (tool: string, args: any, inbound: string, channel: "whatsapp" | "portal") =>
+  proposePending({ party: P, tool, args, echo: `test ${tool}`, proposedText: "stop the reminders", proposedInboundId: inbound, channel });
+const expire = async (id: string) => {
+  const rows = await sbSelect<{ key: string; value: any }>("kv", `select=key,value&${scratch}&limit=50`);
+  const row = rows.find((r) => r.value.id === id)!;
+  await sbUpdate("kv", `key=eq.${encodeURIComponent(row.key)}`, { value: { ...row.value, expires_at: new Date(Date.now() - 1000).toISOString() }, updated_at: Date.now() });
+};
 
 try {
-  const a = await proposePending({ party: P, tool: "delete_event", args: { ids: ["e1", "e2", "e3", "e4"] }, proposedInboundId: "wamid.PROPOSE" });
-  ok(!!a && a.status === "pending", "propose writes a pending action");
-  const dup = await proposePending({ party: P, tool: "delete_event", args: { ids: ["e1", "e2", "e3", "e4"] }, proposedInboundId: "wamid.PROPOSE2" });
-  ok(dup?.id === a?.id, "an identical proposal does not create a second thing to confirm");
-  ok((await findOpenPending(P))?.id === a?.id, "the router can find the open proposal");
-  ok((await confirmAndClaim(a!.id, "wamid.PROPOSE")) === null, "self-confirm refused: the proposing message cannot confirm itself");
-  const both = await Promise.all([confirmAndClaim(a!.id, "wamid.YES"), confirmAndClaim(a!.id, "wamid.YES2")]);
-  ok(both.filter(Boolean).length === 1, "two racing confirmations: exactly one executes");
-  await markExecuted(a!.id, { ok: true, result: { deleted: 4 } });
-  ok((await findOpenPending(P)) === null, "once executed it is closed; a later yes cannot re-run it");
-  const b = await proposePending({ party: P, tool: "delete_task", args: { id: "t9" }, proposedInboundId: "wamid.P3" });
-  await cancelPending(b!.id);
-  ok((await findOpenPending(P)) === null, "a declined proposal is retired");
-  ok((await confirmAndClaim(b!.id, "wamid.LATEYES")) === null, "a stale yes after a no cannot resurrect it");
+  // --- WhatsApp: only a tap on the action's own button runs it ---
+  const w = await hold("delete_event", { ids: ["w1", "w2"] }, "wamid.W1", "whatsapp");
+  ok(w?.status === "pending" && w?.channel === "whatsapp", "a WhatsApp hold is pending and bound to WhatsApp");
+  ok((await findOpenHold(P, "whatsapp"))?.id === w!.id, "the open WhatsApp hold is findable (to re-send its buttons)");
+  ok((await findOpenHold(P, "portal")) === null, "it is invisible to the portal");
+  ok((await claimByTap(w!.id, "someone-else", "wamid.TAP0")) === null, "a tap from another party cannot claim it");
+  const taps = await Promise.all([claimByTap(w!.id, P, "wamid.TAP1"), claimByTap(w!.id, P, "wamid.TAP2")]);
+  ok(taps.filter(Boolean).length === 1, "a double tap executes exactly once");
+  ok((await holdStatus(w!.id))?.status === "confirmed", "while it runs, a later tap reads 'still working' from the record");
+  ok(!!(await recentlyExecutedSame(P, "delete_event", { ids: ["w1", "w2"] })), "an in-flight action blocks re-holding the same one (no duplicate send)");
+  await markExecuted(w!.id, { ok: true, result: { deleted: ["w1", "w2"] } });
+  ok((await holdStatus(w!.id))?.status === "executed", "after it runs, a later tap reads 'already done'");
+
+  const failedSend = await hold("send_email", { to: "a@b.c", subject: "s", body: "b" }, "wamid.F1", "whatsapp");
+  await claimByTap(failedSend!.id, P, "wamid.FTAP");
+  await markExecuted(failedSend!.id, { ok: false, error: "SMTP timeout" });
+  ok((await recentlyExecutedSame(P, "send_email", { to: "a@b.c", subject: "s", body: "b" })) === null, "a FAILED send does not count as sent, so he can retry");
+
+  const late = await hold("call_owner", { message: "late" }, "wamid.L1", "whatsapp");
+  await expire(late!.id);
+  ok((await claimByTap(late!.id, P, "wamid.LTAP")) === null, "a tap on an EXPIRED button runs nothing");
+
+  const x1 = await hold("delete_note", { id: "n1" }, "wamid.X1", "whatsapp");
+  const x2 = await hold("delete_contact", { id: "c1" }, "wamid.X2", "whatsapp");
+  ok((await claimByTap(x1!.id, P, "wamid.XTAP")) === null, "a newer hold replaces the older one; the old button runs nothing");
+  ok((await findOpenHold(P, "whatsapp"))?.id === x2!.id, "only the newest hold is live");
+
+  const same1 = await hold("delete_event", { ids: ["s"] }, "wamid.S1", "whatsapp");
+  const same2 = await hold("delete_event", { ids: ["s"] }, "wamid.S2", "whatsapp");
+  ok(same1?.id === same2?.id, "asking for the identical action twice holds ONE thing, not two");
+  await cancelPending(same2!.id);
+  ok((await claimByTap(same2!.id, P, "wamid.STAP")) === null, "a cancelled hold's button runs nothing");
+
+  // --- honest cancel: something that already ran is reported as run ---
+  ok((await lastExecuted(P))?.id === w!.id, "the last action that actually ran is findable, so 'cancel' can say it already happened");
+  // (the portal no longer holds anything: dispatch refuses deletes and sends there)
 } finally {
   await sbDelete("kv", scratch);
   const left = await sbSelect("kv", `select=key&${scratch}`);

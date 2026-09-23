@@ -21,6 +21,11 @@ export type Domain = "calendar" | "tasks" | "docs" | "comms" | "money" | "genera
 // stays here on the never-worse rule). Everything else moved to the lane(s) that
 // actually use it; `general` (full toolset) still exposes all of them on ambiguity.
 const CROSS_CUTTING = [
+  // set_reminder: "remind me" can arrive in any lane's words, and without it the
+  // model falls back to create_task, which never pings him.
+  "set_reminder",
+  // cancel_held_action: "don't send it" can arrive in any lane's words.
+  "cancel_held_action",
   "find_contact", "query_memory", "query_calendar", "get_settings",
   "remember_preference", "add_note",
   // NOTE (KT #206597): remember_fact + entity_dashboard were considered for

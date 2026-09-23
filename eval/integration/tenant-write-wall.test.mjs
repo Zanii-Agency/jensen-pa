@@ -27,9 +27,25 @@ test("Jensen's own turn writes normally (never walled)", () => {
   }
 });
 
-test("reads and sends are never walled, even on a dev turn", () => {
-  for (const name of ["list_tasks", "query_calendar", "search_documents", "send_filed_document", "reply_email", "day_log", "find_contact"]) {
+test("reads, and sending a file back to whoever asked, are never walled on a dev turn", () => {
+  for (const name of ["list_tasks", "query_calendar", "search_documents", "send_filed_document", "day_log", "find_contact"]) {
     assert.equal(skipTenantWriteForDev(name, "taona"), false, `${name} must not be walled`);
+  }
+});
+
+// Law 10: test traffic never reaches a real person. Until 2026-09-23 these outward
+// sends were unwalled, so a developer typing "yes" during a test could send a real
+// email from Jensen's mailbox, invite a real guest, or ring his phone -- the same
+// class as the 2026-09-09 zanii.ai incident (a prod test fired ~9 real emails).
+test("a dev turn can never make a real outward send from Jensen's accounts", () => {
+  for (const name of ["send_email", "reply_email", "send_meeting_invite", "call_owner", "sanad_draft_contract"]) {
+    assert.equal(skipTenantWriteForDev(name, "taona"), true, `taona ${name} must be walled`);
+  }
+});
+
+test("Jensen's own turns still send for real", () => {
+  for (const name of ["send_email", "reply_email", "send_meeting_invite", "call_owner"]) {
+    assert.equal(skipTenantWriteForDev(name, "jensen"), false, `jensen ${name} must not be walled`);
   }
 });
 

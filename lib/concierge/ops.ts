@@ -1,7 +1,7 @@
 // Granular data operations for the concierge tools. Raw PostgREST (see rest.ts)
 // so it works on Node 20 and Vercel alike. One row per call. Server-only.
 
-import { sbSelect, sbInsert, sbUpsert, sbUpdate, sbDelete, enc } from "./rest";
+import { sbSelect, sbInsert, sbUpsert, sbUpdate, sbDelete, sbDeleteReturning, enc } from "./rest";
 import { dubaiToday, dubaiHHMM } from "../time";
 import { kvGet, kvSet } from "../db";
 
@@ -315,18 +315,16 @@ export async function updateEvent(i: any) {
 }
 // Accepts one id or many. A reminder SERIES is N separate event rows (the DJ
 // payment chase on 16 Sep was six of them), so one-at-a-time deletion meant one
-// confirmation per row -- which is how Jensen ended up asking four times and
-// still getting reminded. `in.(...)` removes the whole series in one statement,
-// so the series dies in a single confirm.
+// confirmation per row. Returns the ids ACTUALLY deleted, so the reply can say
+// "removed all 4" only when four rows really went, and "already gone" when none did.
 export async function deleteEvent(id: string | string[]) {
-  const ids = (Array.isArray(id) ? id : [id]).filter(Boolean);
+  const ids = (Array.isArray(id) ? id : [id]).map((x) => String(x ?? "").trim()).filter(Boolean);
   if (!ids.length) return { deleted: [] as string[] };
-  if (ids.length === 1) {
-    await sbDelete("events", `id=eq.${enc(ids[0])}`);
-    return { deleted: ids };
-  }
-  await sbDelete("events", `id=in.(${ids.map((x) => enc(x)).join(",")})`);
-  return { deleted: ids };
+  const gone = await sbDeleteReturning<{ id: string }>(
+    "events",
+    ids.length === 1 ? `id=eq.${enc(ids[0])}&select=id` : `id=in.(${ids.map((x) => enc(x)).join(",")})&select=id`,
+  );
+  return { deleted: gone.map((r) => r.id) };
 }
 
 // complete_event (KT #288). When Jensen says "Sara done / Toana done", Dorje

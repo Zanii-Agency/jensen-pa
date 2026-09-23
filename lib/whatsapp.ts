@@ -57,6 +57,62 @@ export async function sendWhatsApp(to: string, body: string, opts?: { force?: bo
 // Returns Meta's wamid on success alongside ok. Same wall + chokepoint behavior
 // as sendWhatsApp (signature gate, training gate, dash strip, brand wall). The
 // chokepoint logic is here once; sendWhatsApp is a thin boolean wrapper.
+// Reply buttons (WhatsApp interactive). Used for ONE thing: confirming a held
+// destructive action. A tap comes back carrying the button id, which names the
+// exact held action, so it cannot be confused with an "ok" to a reminder, a stale
+// message, or anything injected into the conversation. Typed text cannot forge it.
+//
+// Same guards as sendWhatsAppRaw, in the same order: configured, training gate,
+// mute kill switch, Law 5 dash repair, then THE WALL. A walled body is NOT sent as
+// buttons; the caller gets dropped:true and handles it (Law 2: no side door).
+// Body is capped at WhatsApp's 1024-char interactive limit by the caller.
+export async function sendWhatsAppInteractive(
+  to: string,
+  bodyText: string,
+  buttons: { id: string; title: string }[],
+  opts?: { force?: boolean },
+): Promise<{ ok: boolean; wamid: string | null; dropped?: boolean }> {
+  if (!waConfigured()) return { ok: false, wamid: null };
+  if (!passesTrainingGate(to, bodyText, opts)) return { ok: false, wamid: null };
+  try {
+    const { kvGet } = await import("@/lib/db");
+    if (await kvGet("bot_muted", false)) return { ok: false, wamid: null };
+  } catch { /* fail open, as sendWhatsAppRaw does */ }
+  let cleaned = stripDashes(bodyText).slice(0, 1024);
+  if (whoIs(to).role !== "developer") {
+    try {
+      const { sanitizeReply } = await import("@/lib/bot-guards/index.js");
+      const { JENSEN_BOT_GUARDS_CONFIG } = await import("@/lib/bot/guards-config");
+      const g = sanitizeReply(cleaned, JENSEN_BOT_GUARDS_CONFIG);
+      if (g.dropped) return { ok: false, wamid: null, dropped: true };
+      cleaned = g.body; // strip-mode guards edit text; the button body must carry the edit too
+    } catch { /* the wall must never break delivery; same policy as sendWhatsAppRaw */ }
+  }
+  try {
+    const res = await fetch(`https://graph.facebook.com/v21.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text: cleaned },
+          action: { buttons: buttons.slice(0, 3).map((b) => ({ type: "reply", reply: { id: b.id.slice(0, 256), title: b.title.slice(0, 20) } })) },
+        },
+      }),
+    });
+    mirrorToOperator(`${cleaned}\n[${buttons.map((b) => b.title).join("] [")}]`, "out", "", to).catch(() => {});
+    if (!res.ok) return { ok: false, wamid: null };
+    let wamid: string | null = null;
+    try { const j: any = await res.json(); wamid = j?.messages?.[0]?.id ? String(j.messages[0].id) : null; } catch { /* accepted anyway */ }
+    return { ok: true, wamid };
+  } catch {
+    return { ok: false, wamid: null };
+  }
+}
+
 export async function sendWhatsAppRaw(to: string, body: string, opts?: { force?: boolean }): Promise<{ ok: boolean; wamid: string | null }> {
   if (!waConfigured()) return { ok: false, wamid: null };
   if (!passesTrainingGate(to, body, opts)) return { ok: false, wamid: null };

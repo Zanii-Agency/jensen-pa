@@ -26,7 +26,10 @@ export async function POST(req: NextRequest) {
         };
         send("ack", "");
 
-        const { reply, toolsUsed } = await runConcierge({ messages, channel: "portal", sender });
+        // Each portal request is its own inbound. Without an id no held action can be
+        // confirmed from the portal, and a proposal made here could only be answered
+        // on WhatsApp.
+        const { reply, toolsUsed } = await runConcierge({ messages, channel: "portal", sender, inboundId: `portal:${crypto.randomUUID()}` });
 
         send("done", JSON.stringify({ reply, toolsUsed }));
         controller.close();
