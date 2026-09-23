@@ -811,6 +811,67 @@ check("seam.84 plaintext_credential does NOT eat meeting invites: Zoom ?pwd= + T
   return null;
 });
 
+check("seam.85 destructive gate PROPOSES a durable pending row, never a bare refusal, and forbids claiming it is done (ADR-0002 Phase 1 / the 16-Sep DJ incident)", () => {
+  const src = read("lib/concierge/dispatch.ts");
+  if (!/proposePending\(/.test(src)) return "gate does not write a pending_actions row (the old refuse-only gate is back)";
+  const gate = src.slice(src.indexOf("async function destructiveGate"), src.indexOf("function sanitizeArgs"));
+  if (!gate) return "destructiveGate not found or no longer async";
+  if (!/PROPOSED, NOT DONE/.test(gate)) return "the gate's message does not tell the model the action is only PROPOSED";
+  if (!/MUST NOT say it is done/.test(gate)) return "the gate does not forbid claiming completion (this is exactly what produced 'Cleared. All DJ payment reminders wiped.')";
+  // Self-confirm (Class C1) must stay dead: the model's own flag is never honoured.
+  if (/input\?\.confirm === true/.test(gate)) return "the model's own `confirm` flag is honoured again (Class C1 self-confirm reopened)";
+  if (!/_confirmed === true/.test(gate)) return "the server-set _confirmed escape hatch is missing (the router could not execute)";
+  // Fail-safe: no table -> previous behaviour, never worse.
+  if (!/if \(!pending\)/.test(gate)) return "no fail-safe branch for an absent pending_actions table";
+  return null;
+});
+
+check("seam.86 a confirmation is resolved by CODE before the model, and only a DISTINCT inbound can confirm (kills same-turn self-confirm)", () => {
+  const loop = read("lib/concierge/loop.ts");
+  if (!/export async function confirmRouter/.test(loop)) return "confirmRouter missing";
+  if (!/confirmAndClaim\(/.test(loop)) return "router does not claim the row via confirmAndClaim (no distinct-inbound guard)";
+  if (!/cancelPending\(/.test(loop)) return "router never retires a declined proposal; a stale pending could be resurrected by a later unrelated yes";
+  // The router must run BEFORE the model gets the turn, or the model is still the decider.
+  const routerCall = loop.indexOf("await confirmRouter({");
+  const modelCall = loop.indexOf("const route = routeDomain(lastUser)");
+  if (routerCall < 0) return "confirmRouter is never called";
+  if (modelCall > 0 && routerCall > modelCall) return "confirmRouter runs AFTER the model routing; it must resolve the turn first";
+  // The distinct-inbound invariant itself lives in the data module.
+  const pa = read("lib/concierge/pending-actions.ts");
+  if (!/SELF-CONFIRM/.test(pa)) return "confirmAndClaim no longer refuses a confirm from the proposing inbound";
+  // And the id has to actually reach the loop from the webhook, or nothing can be distinct.
+  const hook = read("app/api/whatsapp/route.ts");
+  if (!/inboundId: inboundWamid/.test(hook)) return "the webhook does not thread inboundWamid into runConcierge; every confirm would look identity-less";
+  return null;
+});
+
+check("seam.87 no tool advertises the confirm:true protocol the gate ignores (never print an instruction the parser does not accept)", () => {
+  const tools = read("lib/concierge/tools.ts");
+  if (/confirm:true/.test(tools)) return "a tool description still tells the model to 'call again with confirm:true', which the gate ignores -> the model believes the action ran";
+  if (/confirm: bool\(/.test(tools)) return "an inert `confirm` input remains on a tool schema; the model will set it and infer it did something";
+  return null;
+});
+
+check("seam.88 a reminder SERIES dies in ONE confirmation (delete_event takes ids) — the DJ chase was 6 rows, asked 4 times, never deleted", () => {
+  const tools = read("lib/concierge/tools.ts");
+  const def = (tools.match(/\{ name: "delete_event",[\s\S]{0,900}?\n/) || [""])[0];
+  if (!def) return "delete_event tool definition not found";
+  if (!/ids/.test(def)) return "delete_event still takes a single id; stopping a 6-row series would need 6 separate confirmations";
+  const dispatch = read("lib/concierge/dispatch.ts");
+  if (!/deleteEvent\(input\.ids\?\.length \? input\.ids : input\.id\)/.test(dispatch)) return "dispatch does not pass ids through to ops.deleteEvent";
+  const ops = read("lib/concierge/ops.ts");
+  if (!/id=in\.\(/.test(ops)) return "ops.deleteEvent has no bulk path";
+  return null;
+});
+
+check("seam.89 confirming never swallows the rest of the turn ('yes, and book 3pm' still books 3pm)", () => {
+  const loop = read("lib/concierge/loop.ts");
+  if (!/export function isBareConfirmation/.test(loop)) return "isBareConfirmation missing; a compound confirm would short-circuit the model";
+  if (!/isBareConfirmation\(lastUser\)/.test(loop)) return "the short-circuit is not gated on a BARE confirmation";
+  if (!/if \(confirmOutcome\) reply = /.test(loop)) return "a compound confirm's outcome is never prepended to the model reply; the execution would go unreported";
+  return null;
+});
+
 check("seam.63 emailed meeting links reach the event row (meetingUrl threads inbox->route->addEmailEvent->addEvent) (KT #342)", () => {
   // addEvent must actually WRITE meeting_url (it silently omitted it before)
   const db = read("lib/db.ts");
@@ -892,7 +953,12 @@ check("seam.69 send_meeting_invite: real .ics REQUEST over the mailbox's own SMT
   const tools = read("lib/concierge/tools.ts");
   if (!/name:\s*"send_meeting_invite"/.test(tools)) return "send_meeting_invite tool missing";
   const td = tools.slice(tools.indexOf("send_meeting_invite"), tools.indexOf("send_meeting_invite") + 1400);
-  if (!/confirm:\s*bool/.test(td)) return "send_meeting_invite has no confirm arg (Law 8)";
+  // The confirm is no longer a model-supplied arg. ADR-0002 Phase 1 moved it to a
+  // durable server-side hold (pending_actions + confirm-router), which is strictly
+  // stronger: the model cannot assert it, and only a DISTINCT later inbound executes
+  // it. What must stay true is that the tool is HELD and says so.
+  if (/confirm:\s*bool/.test(td)) return "send_meeting_invite still takes a model-supplied confirm arg (the gate ignores it; the model would infer it sent)";
+  if (!/HELD until Jensen confirms/.test(td)) return "send_meeting_invite does not tell the model it is held pending confirmation (Law 8)";
   const disp = read("lib/concierge/dispatch.ts");
   const dset = disp.slice(disp.indexOf("DESTRUCTIVE"), disp.indexOf("DESTRUCTIVE") + 500);
   if (!/"send_meeting_invite"/.test(dset)) return "send_meeting_invite not in the DESTRUCTIVE confirm set";

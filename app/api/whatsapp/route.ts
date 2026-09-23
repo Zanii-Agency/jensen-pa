@@ -280,7 +280,7 @@ export async function POST(req: NextRequest) {
       const party = sender.role !== "owner" ? "taona" : "jensen";
       // Persist with a [voice note] marker so chat history shows it came as audio.
       await ops.chatAppend("user", `[voice note] ${transcript}`, "whatsapp", party, { externalId: inboundWamid }).catch(() => {});
-      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: transcript }], channel: "whatsapp", sender });
+      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: transcript }], channel: "whatsapp", sender, inboundId: inboundWamid });
       await sendWhatsApp(from, reply || "I'm here.");
       return NextResponse.json({ ok: true });
     }
@@ -614,7 +614,7 @@ export async function POST(req: NextRequest) {
     // log the error to the audit channel so the operator sees it. The inbound
     // is already persisted above (NO-CHAT-LOST), so nothing is lost either way.
     try {
-      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: turnInput }], channel: "whatsapp", sender, swipeAnchor });
+      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: turnInput }], channel: "whatsapp", sender, swipeAnchor, inboundId: inboundWamid });
       await sendWhatsApp(from, reply || "I'm here.");
     } catch (brainErr: any) {
       await sendWhatsApp(
