@@ -5,7 +5,8 @@
 import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
 import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
-import { runAction, isDestructive } from "./dispatch";
+import { runAction, isDestructive, isConfirmation } from "./dispatch";
+import { findOpenPending, confirmAndClaim, markExecuted, cancelPending } from "./pending-actions";
 import { honestReply, isUnbackedClaim } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
 import { recall, captureSalience, listDirectives } from "./brain";
@@ -249,7 +250,73 @@ async function emitRoute(party: string, domain: Domain, reason: string, scoped: 
   } catch { /* best-effort; routing must never fail a turn */ }
 }
 
-export async function runConcierge(input: { messages: { role: "user" | "assistant"; content: string }[]; channel?: string; sender?: Sender; swipeAnchor?: { quotedExcerpt: string } | null }): Promise<ConciergeResult> {
+
+// ADR-0002 Phase 1 — the DETERMINISTIC confirm-router.
+//
+// The model proposes; this executes. It runs BEFORE the model on every turn, so
+// a confirmation is resolved by code reading a durable row, never by the model
+// deciding it was confirmed. The load-bearing rule lives in confirmAndClaim: a
+// confirm whose inbound id equals the PROPOSING inbound id is refused, which is
+// what structurally kills same-turn self-confirm (Class C1).
+//
+// Returns a reply string when it handled the turn, or null to fall through to
+// the model. Fail-safe throughout: no pending row, no inbound id, or an absent
+// table all return null and the turn behaves exactly as it did before.
+const NEGATION_RE = /\b(no|nope|nah|don'?t|do not|cancel|stop|wait|not yet|never ?mind|leave it|forget it)\b/i;
+
+function humanOutcome(tool: string, ok: boolean, n: number): string {
+  if (!ok) return "I could not complete that. Nothing changed, so it is still exactly as it was.";
+  const many = n > 1 ? ` All ${n} of them.` : "";
+  if (tool.startsWith("delete_event")) return `Done. Cleared from your calendar.${many}`;
+  if (tool === "delete_task") return "Done. Off your board.";
+  if (tool === "delete_entity") return "Done. Removed.";
+  if (tool === "delete_contact") return "Done. Contact removed.";
+  if (tool === "delete_note") return "Done. Note removed.";
+  if (tool === "delete_document") return "Done. Document removed.";
+  if (tool === "delete_finance") return "Done. Entry removed.";
+  if (tool === "forget_memory") return "Done. Forgotten.";
+  if (tool === "reply_email" || tool === "send_email") return "Sent.";
+  if (tool === "send_meeting_invite") return "Invite sent.";
+  if (tool === "call_owner") return "Calling you now.";
+  return "Done.";
+}
+
+// True when the turn is ONLY a confirmation ("yes", "go ahead", "yes please").
+// A compound turn ("yes, and put a meeting at 3pm") must still reach the model,
+// or confirming would silently swallow whatever else he asked for.
+export function isBareConfirmation(text: string): boolean {
+  const lines = String(text || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length > 1) return false;
+  const t = (lines[0] || "").replace(/[.!,\s]+$/, "");
+  return t.length <= 24 && isConfirmation(t);
+}
+
+export async function confirmRouter(ctx: {
+  party: string; lastUser: string; inboundId?: string | null;
+}): Promise<string | null> {
+  if (!ctx.inboundId) return null; // no inbound identity -> cannot prove a DISTINCT confirm
+  const open = await findOpenPending(ctx.party);
+  if (!open) return null;
+
+  // An explicit "no" retires the proposal so a later unrelated "yes" can never
+  // resurrect it. Checked BEFORE the confirmation test on purpose.
+  if (NEGATION_RE.test(ctx.lastUser) && !isConfirmation(ctx.lastUser)) {
+    await cancelPending(open.id);
+    return "Left it as it is.";
+  }
+  if (!isConfirmation(ctx.lastUser)) return null;
+
+  const claimed = await confirmAndClaim(open.id, ctx.inboundId);
+  if (!claimed) return null; // self-confirm, expired, or lost the race -> model handles it
+
+  const args = { ...(claimed.args || {}), _confirmed: true };
+  const n = Array.isArray((claimed.args || {}).ids) ? (claimed.args as any).ids.length : 1;
+  const r = await runAction(claimed.tool, args, { party: ctx.party, lastUser: ctx.lastUser, inboundId: ctx.inboundId });
+  await markExecuted(claimed.id, { ok: r.ok, result: r.result, error: r.error });
+  return humanOutcome(claimed.tool, r.ok, n);
+}
+
+export async function runConcierge(input: { messages: { role: "user" | "assistant"; content: string }[]; channel?: string; sender?: Sender; swipeAnchor?: { quotedExcerpt: string } | null; inboundId?: string | null }): Promise<ConciergeResult> {
   const history = input.messages.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-16);
   const lastUser = [...history].reverse().find((m) => m.role === "user")?.content || "";
   // Onboarding gate: until prefs.onboarding is explicitly turned off, the OWNER
@@ -270,6 +337,25 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // Jensen; his messages and memory never mix into Jensen's, and only the admin
   // toolset can read Jensen's chats (one-way).
   const party = (input.sender?.role ?? "owner") !== "owner" ? "taona" : "jensen";
+
+  // Confirm-router first: if this turn confirms (or declines) a held destructive
+  // action, code resolves it and the model never sees the turn.
+  let confirmOutcome: string | null = null;
+  try {
+    confirmOutcome = await confirmRouter({ party, lastUser, inboundId: input.inboundId });
+    // A bare "yes" is fully answered by the outcome line, so the model never runs.
+    // A compound turn keeps going: the outcome is prepended to whatever the model
+    // does with the rest, so confirming can never swallow the other half.
+    if (confirmOutcome && isBareConfirmation(lastUser)) {
+      const chOut = input.channel || "portal";
+      try {
+        if (lastUser && chOut !== "whatsapp") await ops.chatAppend("user", lastUser, chOut, party);
+        await ops.chatAppend("assistant", confirmOutcome, chOut, party);
+      } catch { /* logging must never block the reply */ }
+      return { reply: confirmOutcome, toolsUsed: [] };
+    }
+  } catch { /* fail-safe: any router fault falls through to the model */ }
+
   const toolset0 = (input.sender?.role ?? "owner") !== "owner" ? TOOLS : TOOLS.filter((t) => !ADMIN_ONLY.has(t.name));
 
   // MESH ROUTER (Phase 3 — de-monolith). Scope the toolset to the routed domain so
@@ -358,7 +444,7 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
           }
           destructiveUsedThisTurn++;
         }
-        const r = await runAction(tu.name, tu.input || {}, { party, lastUser });
+        const r = await runAction(tu.name, tu.input || {}, { party, lastUser, inboundId: input.inboundId });
         runs.push({ name: tu.name, ok: r.ok, result: r.ok ? r.result : { summary: r.error } });
         toolResults.push({
           type: "tool_result",
@@ -384,6 +470,9 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // persist to the shared chat log + capture durable facts (non-blocking best-effort).
   // WhatsApp inbound is already persisted at the top of app/api/whatsapp/route.ts
   // (NO-CHAT-LOST). For the portal channel we still own the inbound write here.
+  // A compound confirm ("yes, and book 3pm") executed above; lead with what
+  // actually happened so the confirmation is never reported only by the model.
+  if (confirmOutcome) reply = `${confirmOutcome}\n\n${reply}`.trim();
   const ch = input.channel || "portal";
   try {
     if (lastUser && ch !== "whatsapp") await ops.chatAppend("user", lastUser, ch, party);

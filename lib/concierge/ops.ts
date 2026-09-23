@@ -313,7 +313,21 @@ export async function updateEvent(i: any) {
   await sbUpdate("events", `id=eq.${enc(i.id)}`, patch);
   return { id: i.id, updated: Object.keys(patch) };
 }
-export async function deleteEvent(id: string) { await sbDelete("events", `id=eq.${enc(id)}`); return { deleted: id }; }
+// Accepts one id or many. A reminder SERIES is N separate event rows (the DJ
+// payment chase on 16 Sep was six of them), so one-at-a-time deletion meant one
+// confirmation per row -- which is how Jensen ended up asking four times and
+// still getting reminded. `in.(...)` removes the whole series in one statement,
+// so the series dies in a single confirm.
+export async function deleteEvent(id: string | string[]) {
+  const ids = (Array.isArray(id) ? id : [id]).filter(Boolean);
+  if (!ids.length) return { deleted: [] as string[] };
+  if (ids.length === 1) {
+    await sbDelete("events", `id=eq.${enc(ids[0])}`);
+    return { deleted: ids };
+  }
+  await sbDelete("events", `id=in.(${ids.map((x) => enc(x)).join(",")})`);
+  return { deleted: ids };
+}
 
 // complete_event (KT #288). When Jensen says "Sara done / Toana done", Dorje
 // used to punt with "they were calendar events, so marked past automatically",

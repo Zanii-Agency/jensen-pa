@@ -2,6 +2,7 @@
 // model reads back. Errors are surfaced (never a fake success).
 
 import * as ops from "./ops";
+import { proposePending } from "./pending-actions";
 import { recall, rememberFact, queryMemory, rememberDirective, listMemory, forgetMemory } from "./brain";
 import { vatFromNet, corporateTax } from "../tax";
 import { askClaude, NO_DASHES, SONNET } from "../anthropic";
@@ -225,19 +226,76 @@ export function isDestructive(name: string): boolean {
   return DESTRUCTIVE.has(name);
 }
 
-function destructiveGate(name: string, input: any, lastUser: string): { ok: boolean; error?: string } | null {
+// ADR-0002 Phase 1. The gate no longer just REFUSES, it PROPOSES.
+//
+// WHY THIS CHANGED (the 16-Sep DJ incident). The old gate let a destructive call
+// through only when the owner's LAST message matched a yes-pattern. That is the
+// right shape for "bot proposes, owner approves" and the WRONG shape for "owner
+// asks for something destructive", which is how a person actually talks. Jensen
+// tried four times to stop a reminder series: "Payment made for Dj", "DJ payment
+// done", "stop sending me reminder for DJ payment", "no need to send me reminder
+// again about this I already paid him". The gate refused all four, and because
+// two of them contain "stop" / "no", the negation branch read his REQUEST to
+// cancel as him DECLINING to cancel. Six more reminders fired, and the model,
+// with no clean way to surface a refusal, told him they were "wiped". They were
+// never deleted: all five rows were still in the events table a week later.
+//
+// Now an unconfirmed destructive call writes a durable pending_actions row and
+// returns an echo+ask. A DETERMINISTIC router (confirmRouter in loop.ts), not the
+// model, executes it when a DISTINCT later inbound confirms. So "stop the
+// reminders" is asked once and confirmed once, instead of silently refused.
+//
+// Self-confirm (Class C1) stays dead: the model's own `confirm` field is still
+// ignored, `_confirmed` is server-set only, and confirmAndClaim refuses a confirm
+// whose inbound id equals the proposing inbound id.
+//
+// FAIL-SAFE: if pending_actions is absent (migration not yet applied)
+// proposePending returns null and this falls back to the previous behaviour, so
+// the change is never worse than what already shipped.
+async function destructiveGate(
+  name: string,
+  input: any,
+  lastUser: string,
+  ctx?: { party?: string; inboundId?: string | null },
+): Promise<{ ok: boolean; error?: string } | null> {
   if (!DESTRUCTIVE.has(name)) return null;
-  const serverConfirmed = input?._confirmed === true; // server-set only, never the model
-  const ownerConfirmed = isConfirmation(lastUser);
-  if (serverConfirmed || ownerConfirmed) return null;
+  if (input?._confirmed === true) return null; // server-set by the confirm-router only
+
+  const pending = await proposePending({
+    party: ctx?.party || "jensen",
+    tool: name,
+    args: sanitizeArgs(input),
+    proposedInboundId: ctx?.inboundId ?? null,
+  });
+
+  if (!pending) {
+    if (isConfirmation(lastUser)) return null;
+    return {
+      ok: false,
+      error:
+        `Destructive tool '${name}' refused: the owner has not confirmed. ` +
+        `JENSEN-DOCTRINE Law 8: write tools never run inline. ` +
+        `Ask a clear yes/no ('Delete X? Reply yes to confirm') and wait.`,
+    };
+  }
+
   return {
     ok: false,
     error:
-      `Destructive tool '${name}' refused: the owner has not confirmed. ` +
-      `JENSEN-DOCTRINE Law 8: write tools never run inline. ` +
-      `Ask a clear yes/no ('Delete X? Reply yes to confirm') and wait. The action ` +
-      `runs only when the owner's own next message is a yes (a confirm:true flag is ignored).`,
+      `PROPOSED, NOT DONE. '${name}' is held awaiting the owner's confirmation. ` +
+      `Say plainly what you are about to do and ask for a yes, in one short line ` +
+      `(for example: "That clears the 4 remaining DJ reminders. Confirm?"). ` +
+      `You MUST NOT say it is done, cleared, wiped, cancelled or removed. Nothing ` +
+      `has happened yet. It runs only when his NEXT message confirms it.`,
   };
+}
+
+// The stored args are replayed by the router, so strip the model's own confirm
+// flags before persisting: they must never ride back in as if the server set them.
+function sanitizeArgs(input: any): any {
+  if (!input || typeof input !== "object") return input ?? {};
+  const { confirm, _confirmed, ...rest } = input as Record<string, unknown>;
+  return rest;
 }
 
 async function financeSummary(i: { entityId?: string; from?: string; to?: string }) {
@@ -327,9 +385,9 @@ const GEN_SYS = (kind: string) =>
 const LEGAL_SYS = (kind: string, blueprint: string) =>
   `You are Rencontre, drafting a UAE ${kind} for Jensen / La Rencontre. Ground it in this legal blueprint where relevant:\n${blueprint || "(no blueprint saved yet; use sensible UAE defaults and flag where Jensen must fill specifics)"}\nDraft a clear, professional document under Dubai/UAE law. Add a short note that a UAE lawyer should review before signing. ${NO_DASHES} Output the document body only.`;
 
-export async function runAction(name: string, input: any, ctx?: { party?: string; lastUser?: string }): Promise<{ ok: boolean; result?: Result; error?: string }> {
+export async function runAction(name: string, input: any, ctx?: { party?: string; lastUser?: string; inboundId?: string | null }): Promise<{ ok: boolean; result?: Result; error?: string }> {
   try {
-    const gated = destructiveGate(name, input, ctx?.lastUser || "");
+    const gated = await destructiveGate(name, input, ctx?.lastUser || "", { party: ctx?.party, inboundId: ctx?.inboundId });
     if (gated) return gated;
     // Party wall: a non-Jensen (admin/dev/test) turn never persists to Jensen's
     // tenant. Return a simulated result so the model can tell the operator what it
@@ -472,7 +530,7 @@ export async function runAction(name: string, input: any, ctx?: { party?: string
         break;
       }
       case "update_event": { await reconcileEventDate(ctx, input); await attachMeetingLink(ctx, input); result = await ops.updateEvent(input); break; }
-      case "delete_event": result = await ops.deleteEvent(input.id); break;
+      case "delete_event": result = await ops.deleteEvent(input.ids?.length ? input.ids : input.id); break;
       case "complete_event": {
         // Wall 2: complete_event was added 2026-06-15 (KT #288) precisely for
         // the "Sara done / Toana done" case. That tool's bug is the same shape

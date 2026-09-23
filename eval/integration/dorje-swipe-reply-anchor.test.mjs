@@ -234,9 +234,20 @@ check("seam: refusal observability emits dorje.discriminator_mismatch_refused", 
 
 check("seam: runAction signature accepts ctx and loop.ts threads party in", () => {
   const dsrc = read("lib/concierge/dispatch.ts");
-  if (!/export async function runAction\(name: string, input: any, ctx\?\s*:\s*\{\s*party\?\s*:\s*string;\s*lastUser\?\s*:\s*string\s*\}\)/.test(dsrc)) return "runAction signature missing ctx { party, lastUser }";
+  // ctx gained `inboundId` in ADR-0002 Phase 1 so the confirm layer can bind a
+  // proposal to the message that proposed it. Assert the fields are PRESENT rather
+  // than pinning the exact signature string, so extending ctx does not fail this.
+  const sig = (dsrc.match(/export async function runAction\([^)]*\)/) || [""])[0];
+  if (!sig) return "runAction signature not found";
+  for (const f of ["party", "lastUser", "inboundId"]) {
+    if (!new RegExp(f).test(sig)) return `runAction ctx missing ${f}`;
+  }
   const lsrc = read("lib/concierge/loop.ts");
-  if (!/runAction\(tu\.name, tu\.input \|\| \{\}, \{\s*party,\s*lastUser\s*\}\)/.test(lsrc)) return "loop does not thread party + lastUser into runAction";
+  const call = (lsrc.match(/runAction\(tu\.name, tu\.input \|\| \{\}, \{[^}]*\}\)/) || [""])[0];
+  if (!call) return "loop does not thread a ctx into runAction";
+  for (const f of ["party", "lastUser", "inboundId"]) {
+    if (!new RegExp(f).test(call)) return `loop does not thread ${f} into runAction`;
+  }
   return null;
 });
 
