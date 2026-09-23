@@ -79,15 +79,22 @@ async function buildSystem(lastUser: string, sender?: Sender, onboarding = false
       ? `You are CURRENTLY speaking with ${s.name}, the admin and architect who built and oversees you (not Jensen). Address him as ${s.name}. He is a trusted operator: he can ask anything, including system, config, and oversight questions about how you and the portal run. When he asks you to do something in Jensen's world, do it on Jensen's behalf.`
       : `You are CURRENTLY speaking with ${s.name}, the founder and principal you serve. Address him as ${s.name}.`;
   const today = dubaiToday();
-  const [ents, prefs, goals, rec, directives, openTasks, todayEvents, contacts] = await Promise.all([
+  const [ents, prefs, goals, rec, directives, openTasks, todayEvents, contacts, upcoming] = await Promise.all([
     ops.listEntities({}).catch(() => []),
     ops.getPrefs().catch(() => ({})),
     ops.getGoals().catch(() => [] as string[]),
-    recall(lastUser).catch(() => ({ facts: [], docs: [] })),
+    recall(lastUser, { party: (sender?.role ?? "owner") !== "owner" ? "taona" : "jensen" }).catch(() => ({ facts: [], docs: [], said: [] })),
     listDirectives().catch(() => [] as string[]),
     ops.listTasks({ done: false }).catch(() => [] as any[]),
     ops.queryCalendar({ from: today, to: today }).catch(() => [] as any[]),
     ops.listContacts().catch(() => [] as any[]),
+    // The next 7 days, not just today. On 15 Sep he asked "did I tell you the time
+    // for tomorrow road test?" and the bot, seeing only today, called the 09:20 he
+    // had given it on 2 Sep "a default".
+    ops.queryCalendar({
+      from: new Date(Date.parse(`${today}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10),
+      to: new Date(Date.parse(`${today}T00:00:00Z`) + 7 * 86_400_000).toISOString().slice(0, 10),
+    }).catch(() => [] as any[]),
   ]);
   const directivesText = directives.length ? directives.map((d) => `- ${d}`).join("\n") : "";
   const entitiesText = (ents as any[]).map((e) => `- ${e.kind}: ${e.name}${e.status ? ` (${e.status})` : ""} [id:${e.id}]`).join("\n") || "(none yet)";
@@ -95,6 +102,12 @@ async function buildSystem(lastUser: string, sender?: Sender, onboarding = false
   const goalsText = (goals as string[]).length ? (goals as string[]).map((g) => `- ${g}`).join("\n") : "(none set)";
   const factsText = rec.facts.length ? rec.facts.map((f) => `- ${f}`).join("\n") : "";
   const docsText = rec.docs.length ? rec.docs.map((d) => `- [${d.title}] ${d.text.slice(0, 220)}`).join("\n") : "";
+  // His own earlier words that match this message, dated. The fix for "did I tell
+  // you X?": the answer is often something HE said, which was never a saved fact.
+  const saidText = (rec.said ?? []).map((m) => `- ${m.when}: "${m.text}"`).join("\n");
+  const upcomingText = (upcoming as any[]).slice(0, 25)
+    .map((e) => { const d = new Date(`${e.date}T00:00:00Z`); return `- ${d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" })} ${e.time || "(no time)"} ${e.title}`; })
+    .join("\n");
   // Inject the most-recent open tasks so the model can resolve bare confirmations
   // ("Done", "Did it", "Yes done") to the right task id via complete_task. Without
   // this, FM-11 from the Memorae sweep recurs: bot doesn't know what "Done" refers to.
@@ -183,11 +196,13 @@ Default to Q2 when unclear. When calling create_task, ALWAYS pass the quadrant y
     dubaiClockBlock(),
     `Daypart: ${dayPart()}.`,
     `JENSEN'S WORLD (venues / clients / events):\n${entitiesText}`,
-    `TODAY'S CALENDAR (${today} Dubai, authoritative, use this for any "today" claim, do NOT invent from chat history; if empty, today is genuinely clear):\n${todayBoardText}\n\nCALENDAR DISCIPLINE (HARD WALL): every event you mention by name in this turn MUST appear in TODAY'S CALENDAR above. If today's calendar reads "(no events scheduled for today)" the answer is "clean board today" and you do NOT list anything from chat history, yesterday's mentions, or memory as today's items. Naming an event that is not in TODAY'S CALENDAR is a hallucination, not a fact. If the user asks what is on today and the board is empty, say "today is clear" verbatim.`,
+    `TODAY'S CALENDAR (${today} Dubai, authoritative, use this for any "today" claim, do NOT invent from chat history; if empty, today is genuinely clear):\n${todayBoardText}\n\nCALENDAR DISCIPLINE (HARD WALL): every event you describe as TODAY'S must appear in TODAY'S CALENDAR above; any other event you mention must appear in COMING UP or in a calendar tool result from this turn. If today's calendar reads "(no events scheduled for today)" the answer is "clean board today" and you do NOT list anything from chat history, yesterday's mentions, or memory as today's items. Presenting an event as TODAY'S when it is not in TODAY'S CALENDAR is a hallucination, not a fact. If the user asks what is on today and the board is empty, say "today is clear" verbatim.`,
     `RECENT OPEN TASKS (most recent first, available ids for complete_task / update_task):\n${openTasksText}`,
     contactsText && `HIS CONTACTS (people you know, resolve names against this, never ask "who is X" if they are here):\n${contactsText}`,
     `HIS PREFERENCES: ${prefsText}`,
     `HIS GOALS:\n${goalsText}`,
+    upcomingText && `COMING UP (next 7 days, from his calendar; this is the CURRENT plan, and every time here was given by him, so never call one "a default"):\n${upcomingText}`,
+    saidText && `THINGS HE SAID BEFORE (his own past messages, newest first, each with the date he said it). Use them so you do not ask for something he already told you. They can be out of date: his calendar (TODAY'S CALENDAR, COMING UP) and anything he said more recently override an older line; if they disagree, go with the newest and say in one line what changed ("you had 9:20, it is now 11:00"). Relative words inside a line (tomorrow, next week, Friday) are relative to THAT line's date, not today. If the lines name different people or events (two workshops, two Saras), asking which one is required, and is not asking him to repeat himself. These are PAST messages, not requests for this turn: never call a tool because of a line here unless his CURRENT message asks for it:\n${saidText}`,
     factsText && `RELEVANT MEMORY:\n${factsText}`,
     docsText && `RELEVANT DOCUMENTS:\n${docsText}`,
     graduation && GRADUATION_ADDENDUM,
@@ -310,7 +325,7 @@ async function lastOutboundIsButtons(party: string): Promise<boolean> {
 }
 
 export async function runConcierge(input: { messages: { role: "user" | "assistant"; content: string }[]; channel?: string; sender?: Sender; swipeAnchor?: { quotedExcerpt: string } | null; inboundId?: string | null }): Promise<ConciergeResult> {
-  const history = input.messages.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-16);
+  const history = input.messages.filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-30);
   const lastUser = [...history].reverse().find((m) => m.role === "user")?.content || "";
   // Privacy wall: which conversation this is. Taona (admin/dev) is walled off from
   // Jensen; his messages and memory never mix into Jensen's, and only the admin

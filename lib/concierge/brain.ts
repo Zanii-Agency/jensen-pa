@@ -3,6 +3,7 @@
 // PostgREST (rest.ts) so it is deterministic on Node 20 + Vercel. Server-only.
 
 import { sbSelect, sbInsert, sbUpdate, sbRpc, enc } from "./rest";
+import { searchFacts, searchDocs, searchSaid, labelFact, type FoundFact } from "./memory-search";
 import { claudeJSON } from "../anthropic";
 import { embed as openaiEmbed } from "../openai";
 
@@ -10,11 +11,18 @@ const vec = (e: number[]) => `[${e.join(",")}]`;
 const RRF_K = 60;
 const now = () => Date.now();
 
+// Circuit breaker: the embed key has returned 401 since at least June, and every
+// turn paid a failed OpenAI round trip (~250ms measured 2026-09-23) for nothing.
+// After an auth failure, skip embedding for 30 minutes; a working key is picked
+// up again automatically once the window passes.
+let embedDeadUntil = 0;
 async function tryEmbed(text: string): Promise<number[] | null> {
+  if (Date.now() < embedDeadUntil) return null;
   try {
     const [e] = await openaiEmbed([text.slice(0, 4000)]);
     return e || null;
-  } catch {
+  } catch (err: any) {
+    if (/\b40[13]\b/.test(String(err?.message || err))) embedDeadUntil = Date.now() + 30 * 60_000;
     return null;
   }
 }
@@ -112,40 +120,44 @@ function rrf<T>(lists: T[][], key: (t: T) => string): T[] {
   return [...score.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => item.get(k)!).filter(Boolean);
 }
 
-export type Recall = { facts: string[]; docs: { title: string; text: string }[] };
+// said: his own past messages matching this one, dated (see memory-search.ts).
+export type Recall = { facts: string[]; docs: { title: string; text: string }[]; said: { when: string; text: string }[] };
 
-export async function recall(query: string, opts?: { factK?: number; docK?: number }): Promise<Recall> {
+export async function recall(query: string, opts?: { factK?: number; docK?: number; party?: string }): Promise<Recall> {
   const factK = opts?.factK ?? 6;
   const docK = opts?.docK ?? 5;
   const q = (query || "").trim();
-  if (!q) return { facts: [], docs: [] };
-  const qe = await tryEmbed(q);
+  if (!q) return { facts: [], docs: [], said: [] };
+  // Keyword legs run in parallel with the embed call. They used to search for his
+  // WHOLE message as one substring (`fact ilike *<message>*`), which matched almost
+  // nothing, and the embed key has returned 401 since at least June, so memory was
+  // effectively off. memory-search.ts searches the important words instead.
+  const [qe, factKwFacts, kwDocs, said] = await Promise.all([
+    tryEmbed(q),
+    factK ? searchFacts(q, 10) : Promise.resolve([] as FoundFact[]),
+    docK ? searchDocs(q, 10) : Promise.resolve([] as { title: string; content: string }[]),
+    // The SPEAKER's own past words: on a developer turn, Jensen's messages must not
+    // be presented as things the developer said (review, finding 9).
+    searchSaid(q, opts?.party || "jensen", 3).catch(() => [] as { when: string; text: string }[]),
+  ]);
 
   // FACTS
   const factVec: any[] = qe ? await sbRpc("match_brain_facts", { query_embedding: vec(qe), match_count: 10 }).catch(() => []) : [];
-  const factKw: any[] = factK ? await sbSelect("brain_facts", `status=eq.active&fact=ilike.*${enc(q)}*&limit=10&select=fact,source`).catch(() => []) : [];
-  const facts = factK ? rrf<any>([factVec, factKw], (r) => r.fact).slice(0, factK).map((r) => r.fact) : [];
+  // Merge on the RAW fact text (so a fact found by both searches counts once), then
+  // label by source. Vector-only hits carry no source here and stay unlabelled.
+  const labels = new Map(factKwFacts.map((f) => [f.fact, f] as const));
+  const factKw: any[] = factKwFacts.map((f) => ({ fact: f.fact }));
+  const facts = factK
+    ? rrf<any>([factVec, factKw], (r) => r.fact).slice(0, factK).map((r) => labelFact(labels.get(r.fact) ?? { fact: r.fact, label: "" }))
+    : [];
 
   // DOCS
   const docVec: any[] = qe && docK ? await sbRpc("match_doc_chunks", { query_embedding: vec(qe), match_count: 10 }).catch(() => []) : [];
-  const docKwRows: any[] = docK ? await sbSelect("doc_chunks", `text=ilike.*${enc(q)}*&limit=10&select=text,doc_id`).catch(() => []) : [];
-  let titles: Record<string, string> = {};
-  const ids = [...new Set(docKwRows.map((r) => r.doc_id))];
-  if (ids.length) {
-    const t = await sbSelect<any>("docs", `id=in.(${ids.map((i) => enc(String(i))).join(",")})&select=id,title`).catch(() => []);
-    titles = Object.fromEntries(t.map((r) => [r.id, r.title]));
-  }
-  const docKw = docKwRows.map((r) => ({ title: titles[r.doc_id] || "document", content: r.text }));
+  // Keyword docs: important words across title and text (was the whole-message
+  // substring). Covers content-only docs with no chunks (KT #348/#349) as before.
+  const docKw = kwDocs;
   const docVecNorm = docVec.map((r) => ({ title: r.title, content: r.content }));
-  // DOCS-TABLE FALLBACK (embed-down / no-chunks resilience, KT #349). Degraded
-  // intake files docs.content with NO doc_chunks rows (KT #348), and the vector
-  // path is dead whenever the OpenAI embed key is. Without this, recall is blind
-  // to every recently-uploaded doc and the brain cannot ground "find my X" on it.
-  // Keyword-search the docs table directly (title OR content) so content-only
-  // docs still surface. Purely additive: fused as a third source; the existing
-  // chunk-based ranking is unchanged.
-  const docTblRows: any[] = docK ? await sbSelect<any>("docs", `or=(title.ilike.*${enc(q)}*,content.ilike.*${enc(q)}*)&limit=10&select=title,content`).catch(() => []) : [];
-  const docTbl = docTblRows.map((r) => ({ title: r.title || "document", content: (r.content || "").slice(0, 600) }));
+  const docTbl: { title: string; content: string }[] = [];
   // RRF dedup key (Class C5 sibling, KT #206558): key on TITLE + content-prefix,
   // not content-prefix alone. Two DISTINCT docs sharing a letterhead/boilerplate
   // head (common for La Rencontre invoices/letters) collided to one key and one
@@ -153,7 +165,7 @@ export async function recall(query: string, opts?: { factK?: number; docK?: numb
   // the same doc surfaced across arms (same title + same head) still dedups.
   const docs = docK ? rrf<any>([docVecNorm, docKw, docTbl], (r: any) => { const t = String(r?.title || "").trim(); return t && t !== "document" ? "T:" + t.toLowerCase() : "C:" + (r?.content || "").slice(0, 80); }).slice(0, docK).map((r) => ({ title: r.title, text: r.content })) : [];
 
-  return { facts, docs };
+  return { facts, docs, said };
 }
 
 const SALIENCE_SYS =
