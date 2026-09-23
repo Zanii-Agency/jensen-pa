@@ -11,7 +11,7 @@
 // reaskPhrase and the catch is logged for engineering review. The wall is
 // in code; the rules are in lib/bot/guards-config.ts.
 
-import { sendWhatsApp, sendWhatsAppRaw, devPhone } from "@/lib/whatsapp";
+import { sendWhatsApp, sendWhatsAppRaw, sendWhatsAppInteractive, devPhone } from "@/lib/whatsapp";
 import { admin } from "@/lib/db";
 import { sanitizeReply } from "@/lib/bot-guards/index.js";
 import { JENSEN_BOT_GUARDS_CONFIG } from "@/lib/bot/guards-config";
@@ -89,4 +89,36 @@ export async function sendTextAndLog(
     }
   }
   return { ok: sendResult.ok };
+}
+
+// The chokepoint for confirmation buttons (Law 2: every outbound is logged before
+// it is sent). The transcript records the question AND the buttons, so the record
+// shows exactly what he could tap. If the wall kills the body, no buttons go out:
+// he gets the polite line and the developer gets the original, as for any drop.
+export async function sendButtonsAndLog(
+  to: string,
+  body: string,
+  buttons: { id: string; title: string }[],
+  opts?: { party?: string },
+): Promise<{ ok: boolean }> {
+  const party = opts?.party ?? "jensen";
+  const ins = await admin().from("chat_messages").insert({
+    role: "assistant",
+    content: `${body}\n[${buttons.map((b) => b.title).join("] [")}]`,
+    channel: "whatsapp",
+    party,
+    ts: Date.now(),
+  }).select("id").single();
+  const rowId: number | null = (ins?.data as any)?.id ?? null;
+  const r = await sendWhatsAppInteractive(to, body, buttons);
+  if (r.dropped) {
+    const dev = devPhone();
+    if (dev) sendWhatsAppRaw(dev, `[Dorje wall] blocked a confirmation to the client. Original: ${String(body).slice(0, 500)}`, { force: true }).catch(() => {});
+    await sendWhatsAppRaw(to, JENSEN_BOT_GUARDS_CONFIG.reaskPhrase);
+    return { ok: false };
+  }
+  if (r.ok && r.wamid && rowId != null) {
+    try { await admin().from("chat_messages").update({ external_id: r.wamid }).eq("id", rowId); } catch { /* best effort */ }
+  }
+  return { ok: r.ok };
 }

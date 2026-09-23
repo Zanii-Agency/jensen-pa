@@ -10,15 +10,16 @@
 // linked to the project, no SQL-exec RPC). `kv` already exists and the service
 // key already writes it. One row per proposal, key `pending_action:<party>:<id>`.
 //
-// THE RULES THIS FILE ENFORCES (each one closes a real way to act on the wrong thing):
-//  1. One question in flight per party. Proposing cancels any older open one.
-//  2. A proposal is answerable by exactly ONE inbound: the first one after it.
-//     offerPending() binds it to that inbound; the next inbound after that
-//     cancels it. So a casual "yes" to some LATER question can never fire an old
-//     delete. (Adversarial review 2026-09-23, blocker A.)
-//  3. The proposing inbound can never confirm its own proposal (Class C1).
-//  4. The claim is an atomic, status-guarded PATCH: two racing confirmations,
-//     exactly one executes. Proven live 2026-09-23.
+// HOW A HELD ACTION GETS CONFIRMED (v4, 2026-09-23):
+//  - WhatsApp: ONLY by a tap on its own reply button. The button id names this
+//    exact action, so an "ok" to a reminder, a stale message, a swipe, or text
+//    injected into the conversation can never fire it. (Three rounds of review
+//    showed that inferring what a typed "yes" answers is not safely solvable.)
+//  - Portal: a synchronous screen with no scheduled pushes, so the next portal
+//    message may answer it with a bare yes (offerPending + claimPending).
+//  - Either way: one question in flight per party and channel; the proposing
+//    message can never confirm it; the claim is an atomic, status-guarded PATCH
+//    (two racing confirmations, exactly one executes; proven live 2026-09-23).
 //
 // FAIL-SAFE: every function catches and returns null / no-op. The gate treats a
 // null proposal as "could not hold it" and REFUSES (fails closed).
@@ -31,6 +32,7 @@ export type PendingAction = {
   tool: string;
   args: any;
   args_hash: string;
+  channel: string;                     // "whatsapp" | "portal": only that channel can confirm it
   echo: string;                        // the exact question, written by code from the real rows
   proposed_text: string;               // the owner message that asked for it (for the name-mismatch wall)
   proposed_inbound_id: string | null;
@@ -68,10 +70,10 @@ function djb2(s: string): string {
   return (h >>> 0).toString(36);
 }
 
-async function openFor(party: string): Promise<{ key: string; value: PendingAction }[]> {
+async function openFor(party: string, channel: string): Promise<{ key: string; value: PendingAction }[]> {
   return sbSelect<{ key: string; value: PendingAction }>(
     "kv",
-    `select=key,value&${partyLike(party)}&${STATUS_PENDING}&order=updated_at.desc&limit=10`,
+    `select=key,value&${partyLike(party)}&${STATUS_PENDING}&value->>channel=eq.${enc(channel)}&order=updated_at.desc&limit=10`,
   );
 }
 
@@ -83,13 +85,13 @@ async function setValue(key: string, value: PendingAction): Promise<void> {
 // then refuses). An identical still-open proposal is returned as-is; any OTHER
 // open proposal for this party is cancelled, so only one question is ever live.
 export async function proposePending(input: {
-  party: string; tool: string; args: any; echo: string; proposedText: string;
+  party: string; tool: string; args: any; echo: string; proposedText: string; channel: string;
   proposedInboundId?: string | null;
 }): Promise<PendingAction | null> {
   const hash = argsHash(input.tool, input.args);
   try {
     sweep(input.party).catch(() => {});
-    const open = await openFor(input.party);
+    const open = await openFor(input.party, input.channel);
     let same: { key: string; value: PendingAction } | null = null;
     for (const r of open) {
       if (r.value.args_hash === hash && isLive(r.value)) { same = r; continue; }
@@ -120,6 +122,7 @@ export async function proposePending(input: {
       tool: input.tool,
       args: input.args ?? {},
       args_hash: hash,
+      channel: input.channel,
       echo: input.echo,
       proposed_text: input.proposedText,
       proposed_inbound_id: input.proposedInboundId ?? null,
@@ -142,10 +145,10 @@ export async function proposePending(input: {
 // answer, or null. Binds an unoffered proposal to this inbound; cancels any
 // proposal that already had its one reply (rule 2); never offers a proposal to
 // the inbound that created it (rule 3).
-export async function offerPending(party: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
+export async function offerPending(party: string, inboundId: string | null | undefined, channel = "portal"): Promise<PendingAction | null> {
   if (!inboundId) return null;
   try {
-    const open = await openFor(party);
+    const open = await openFor(party, channel);
     let answerable: PendingAction | null = null;
     for (const r of open) {
       const a = r.value;
@@ -169,6 +172,45 @@ export async function offerPending(party: string, inboundId: string | null | und
 
 // Claim for execution. Only the inbound the proposal was offered to can claim
 // it, never the proposing one, and only once.
+export async function findOpenHold(party: string, channel: string): Promise<PendingAction | null> {
+  try {
+    return (await openFor(party, channel)).map((r) => r.value).find(isLive) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Claim on a BUTTON TAP. The tap's id names the action, so there is no question of
+// which message it answers. Requires: still pending, not expired, same party, a
+// WhatsApp hold. Atomic, so a double tap executes once.
+export async function claimByTap(id: string, party: string, tapInboundId: string): Promise<PendingAction | null> {
+  try {
+    const rows = await sbSelect<{ key: string; value: PendingAction }>("kv", `select=key,value&${byId(id)}&limit=1`);
+    const row = rows?.[0];
+    const a = row?.value;
+    if (!row || !a || a.status !== "pending" || !isLive(a) || a.party !== party || a.channel !== "whatsapp") return null;
+    const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: tapInboundId };
+    const won = await sbUpdateReturning<{ value: PendingAction }>(
+      "kv",
+      `key=eq.${enc(row.key)}&${STATUS_PENDING}`,
+      { value: claimed, updated_at: Date.now() },
+    );
+    return won.length === 1 ? won[0].value : null;
+  } catch {
+    return null;
+  }
+}
+
+// What a tap on an old or already-used button should say, read from the record.
+export async function holdStatus(id: string): Promise<PendingAction | null> {
+  try {
+    const rows = await sbSelect<{ value: PendingAction }>("kv", `select=value&${byId(id)}&limit=1`);
+    return rows?.[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function claimPending(id: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
   if (!inboundId) return null;
   try {
@@ -190,22 +232,6 @@ export async function claimPending(id: string, inboundId: string | null | undefi
   }
 }
 
-// Did THIS inbound already confirm something? (A WhatsApp retry or a concurrent
-// invocation that lost the claim.) Lets the router answer "Already done" instead
-// of falling through to a model that might re-hold the same send.
-export async function handledBy(party: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
-  if (!inboundId) return null;
-  try {
-    const rows = await sbSelect<{ value: PendingAction }>(
-      "kv",
-      `select=value&${partyLike(party)}&value->>confirm_inbound_id=eq.${enc(inboundId)}&limit=1`,
-    );
-    return rows?.[0]?.value ?? null;
-  } catch {
-    return null;
-  }
-}
-
 // The same action (same tool, same args) executed in the last few minutes. Used to
 // refuse re-holding an outward send that already went out, so a double-tap can
 // never send the same email twice.
@@ -213,30 +239,9 @@ export async function recentlyExecutedSame(party: string, tool: string, args: an
   try {
     const rows = await sbSelect<{ value: PendingAction }>(
       "kv",
-      `select=value&${partyLike(party)}&value->>status=eq.executed&value->>args_hash=eq.${enc(argsHash(tool, args))}&updated_at=gte.${Date.now() - withinMs}&limit=1`,
+      `select=value&${partyLike(party)}&value->>status=eq.executed&value->>error=is.null&value->>args_hash=eq.${enc(argsHash(tool, args))}&updated_at=gte.${Date.now() - withinMs}&limit=1`,
     );
     return rows?.[0]?.value ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// Re-arm a held action for the NEXT reply. Used when he answered a SEND with a yes
-// in other words: sends only go out on his own plain "yes", so the system re-asks,
-// and that next reply must still be able to answer it.
-export async function rearmPending(id: string, inboundId: string | null | undefined): Promise<PendingAction | null> {
-  try {
-    const rows = await sbSelect<{ key: string; value: PendingAction }>("kv", `select=key,value&${byId(id)}&limit=1`);
-    const row = rows?.[0];
-    if (!row?.value || row.value.status !== "pending") return null;
-    const next: PendingAction = {
-      ...row.value,
-      proposed_inbound_id: inboundId ?? null,
-      offered_to: null,
-      expires_at: new Date(Date.now() + TTL_MS).toISOString(),
-    };
-    await setValue(row.key, next);
-    return next;
   } catch {
     return null;
   }

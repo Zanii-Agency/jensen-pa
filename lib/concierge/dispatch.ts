@@ -284,7 +284,7 @@ export function isDestructive(name: string): boolean {
 async function destructiveGate(
   name: string,
   input: any,
-  ctx?: { party?: string; lastUser?: string; inboundId?: string | null; confirmedPendingId?: string | null },
+  ctx?: { party?: string; lastUser?: string; inboundId?: string | null; confirmedPendingId?: string | null; channel?: string },
 ): Promise<{ ok: boolean; error?: string; held?: { id: string; echo: string } } | null> {
   if (!DESTRUCTIVE.has(name)) return null;
   if (ctx?.confirmedPendingId) return null; // set only by executePending, never reachable from model input
@@ -307,6 +307,7 @@ async function destructiveGate(
     echo: d.echo,
     proposedText: ctx?.lastUser || "",
     proposedInboundId: ctx?.inboundId ?? null,
+    channel: ctx?.channel === "portal" ? "portal" : "whatsapp",
   });
   if (!pending) {
     return {
@@ -320,9 +321,10 @@ async function destructiveGate(
     ok: false,
     held: { id: pending.id, echo: pending.echo },
     error:
-      `HELD, NOTHING HAS HAPPENED YET. The system will put this exact question at the end of your ` +
-      `reply, so do not repeat or rephrase it: "${pending.echo}" Do not say it is done, cleared, ` +
-      `removed, cancelled or sent.`,
+      `HELD, NOTHING HAS HAPPENED YET. The system shows Jensen this exact question itself ` +
+      `(with Yes / No buttons on WhatsApp), so do not repeat or rephrase it: "${pending.echo}" ` +
+      `Keep your own reply to one short line or less. Do not say it is done, cleared, removed, ` +
+      `cancelled or sent.`,
   };
 }
 
@@ -574,7 +576,7 @@ const LEGAL_SYS = (kind: string, blueprint: string) =>
 export async function runAction(
   name: string,
   rawInput: any,
-  ctx?: { party?: string; lastUser?: string; inboundId?: string | null; priorRuns?: number; confirmedPendingId?: string | null },
+  ctx?: { party?: string; lastUser?: string; inboundId?: string | null; priorRuns?: number; confirmedPendingId?: string | null; channel?: string },
 ): Promise<{ ok: boolean; result?: Result; error?: string; held?: { id: string; echo: string } }> {
   try {
     // Confirmation state travels ONLY in ctx, which code builds. Any confirm-ish
@@ -582,8 +584,6 @@ export async function runAction(
     // smuggled in through an email or document can never mark an action approved
     // (review blocker C: the old gate honoured input._confirmed).
     const input = stripConfirmFlags(rawInput);
-
-    if (name === "confirm_pending_action") return confirmPendingAction({ ...input, confirm: rawInput?.confirm }, ctx);
 
     const gated = await destructiveGate(name, input, ctx);
     if (gated) return gated;
@@ -696,8 +696,22 @@ export async function runAction(
       // and receipt. (16 Sep: "remind me in two weeks" became a task, which is never
       // pushed, while the bot told him "Reminder set for 5 October".)
       case "set_reminder": {
-        const ev = { title: String(input.what || input.title || "").trim(), date: input.date, time: input.time || "09:00", note: "Reminder" };
-        await reconcileEventDate(ctx, ev); result = await ops.createEvent(ev); break;
+        const ev: any = {
+          title: String(input.what || input.title || "").trim(),
+          date: input.date,
+          time: input.time || "09:00",
+          note: "Reminder",
+          recurrence: input.recurrence || undefined,          // "every Monday" must repeat, not ping once
+          recurrenceUntil: input.recurrenceUntil || undefined,
+        };
+        await reconcileEventDate(ctx, ev);
+        // A reminder whose moment has already passed today would never ping (the
+        // cron only looks ahead). Ask for a time instead of claiming it is set.
+        const [hh, mm] = String(ev.time).split(":").map(Number);
+        const nowDubai = new Date(Date.now() + 4 * 3_600_000);
+        const passed = ev.date === dubaiToday() && (hh * 60 + (mm || 0)) <= nowDubai.getUTCHours() * 60 + nowDubai.getUTCMinutes();
+        if (passed) { result = { ok: false, error: `${ev.time} today has already passed. Ask Jensen what time today (or which day) he wants the reminder.` }; break; }
+        result = await ops.createEvent(ev); break;
       }
       case "create_event": { await reconcileEventDate(ctx, input); await attachMeetingLink(ctx, input); result = await ops.createEvent(input); break; }
       case "send_email": {
@@ -922,53 +936,3 @@ function stripConfirmFlags(input: any): any {
   return rest;
 }
 
-// The model's way to answer a held question when his reply is not a bare yes/no
-// ("stop them", "go on then", "don't do it"). The model supplies the MEANING; code
-// enforces everything that makes it safe:
-//  - the proposal must have been offered to THIS inbound (a later, distinct message
-//    from Jensen), and only this one (pending-actions.ts rule 2/3);
-//  - it must be the FIRST tool call of the turn, before any email, document or web
-//    content has been read, so injected text cannot trigger it;
-//  - the claim is single-use and atomic.
-async function confirmPendingAction(
-  input: any,
-  ctx?: { party?: string; inboundId?: string | null; priorRuns?: number },
-): Promise<{ ok: boolean; result?: Result; error?: string; held?: { id: string; echo: string } }> {
-  const party = ctx?.party || "jensen";
-  if ((ctx?.priorRuns ?? 0) > 0) {
-    return { ok: false, error: "confirm_pending_action must be the FIRST tool call of the turn. Nothing was done. Ask Jensen to confirm again." };
-  }
-  const { offerPending, claimPending, cancelPending } = await import("./pending-actions");
-  const open = await offerPending(party, ctx?.inboundId);
-  if (!open || open.id !== String(input?.id || "")) {
-    return { ok: false, error: "There is no open question with that id for this message. Nothing was done; do not claim it was." };
-  }
-  const yes = input?.confirm === true || ["true", "yes"].includes(String(input?.confirm ?? "").toLowerCase());
-  if (!yes) {
-    await cancelPending(open.id);
-    return { ok: true, result: { cancelled: true, outcome: "Left it as it is." } };
-  }
-  // An outward send is confirmed ONLY by his own plain "yes" through the code
-  // path, never by the model's reading of a longer message. Recalled documents and
-  // memory are already in the prompt, so injected text could otherwise steer the
-  // model into confirming a send (review 2, finding 6).
-  if (OUTWARD_SENDS.has(open.tool)) {
-    const { rearmPending } = await import("./pending-actions");
-    const again = await rearmPending(open.id, ctx?.inboundId);
-    if (!again) return { ok: false, error: "That send could not be re-armed. Nothing was sent; ask him to ask again." };
-    return {
-      ok: false,
-      // Re-asked VERBATIM: the router only honours a reply to the exact stored
-      // question, so rewording it here would void it. "Send it?" already asks for
-      // the plain yes.
-      held: { id: again.id, echo: again.echo },
-      error: "NOT SENT YET. A send goes out only on his own plain yes; the system is asking him for one. Do not say it was sent.",
-    };
-  }
-  const claimed = await claimPending(open.id, ctx?.inboundId);
-  if (!claimed) return { ok: false, error: "That confirmation could not be applied (already handled or expired). Nothing new was done." };
-  const x = await executePending(claimed, { party, inboundId: ctx?.inboundId });
-  return x.ok || /Test turn/.test(x.outcome)
-    ? { ok: true, result: { executed_tool: x.executedTool, outcome: x.outcome, result: x.result } }
-    : { ok: false, error: x.outcome };
-}

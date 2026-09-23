@@ -6,7 +6,7 @@ import { SONNET, NO_DASHES } from "../anthropic";
 import { TOOLS, ADMIN_ONLY } from "./tools";
 import { routeDomain, scopeToolNames, focusBlock, type Domain } from "./router";
 import { runAction, isDestructive, classifyReply, executePending } from "./dispatch";
-import { offerPending, claimPending, cancelPending, handledBy, type PendingAction } from "./pending-actions";
+import { offerPending, claimPending, cancelPending, findOpenHold, type PendingAction } from "./pending-actions";
 import { sbSelect, enc } from "./rest";
 import { honestReply, isUnbackedClaim } from "./honest-reply";
 import { stripDashes } from "../whatsapp";
@@ -172,11 +172,7 @@ Default to Q2 when unclear. When calling create_task, ALWAYS pass the quadrant y
       : "";
 
   const openQuestionBlock = openQuestion
-    ? `OPEN QUESTION (a held action, id ${openQuestion.id}). Jensen was just asked: "${openQuestion.echo}" His message in THIS turn is the only reply that can answer it. ` +
-      (["send_email", "reply_email", "send_meeting_invite", "call_owner", "sanad_draft_contract"].includes(openQuestion.tool)
-        ? `This one SENDS something to a real person, and only his own plain "yes" sends it. If his message means yes in other words, call confirm_pending_action {"id":"${openQuestion.id}","confirm":true}: the system will then ask him for that plain yes (it does not send). If it means no, call it with "confirm":false.`
-        : `If it means a plain yes to ALL of it (for example "stop them", "go on", "fine do it"), call confirm_pending_action {"id":"${openQuestion.id}","confirm":true} as your FIRST tool call, then relay its outcome text exactly. If he agrees only in part or adds any condition ("yes but keep Friday's"), call it with "confirm":false and then hold the changed set with a fresh tool call. If it means no, call it with "confirm":false.`) +
-      ` If his message is about something else, do NOT call it: the held action lapses, and you answer what he actually asked. Never say the held action is done unless confirm_pending_action returned an outcome that says so.`
+    ? `HELD ACTION WAITING (id ${openQuestion.id}). Jensen was shown: "${openQuestion.echo}" with Yes / No buttons. Nothing you do can confirm it: only his tap on Yes runs it. If his message means yes, tell him in one line to tap Yes on that message. If he wants it changed ("keep Friday's", "only the 5pm one"), make the tool call for the changed set; that replaces it and he gets new buttons. If his message is about something else, just answer it. Never say the held action is done.`
     : "";
 
   const tail = [
@@ -244,7 +240,9 @@ async function callRaw(system: string | { head: string; tail: string }, messages
   return data;
 }
 
-export type ConciergeResult = { reply: string; toolsUsed: string[] };
+// held: a destructive action this turn held for confirmation. On WhatsApp the
+// webhook sends it as Yes / No buttons; the reply text never carries it.
+export type ConciergeResult = { reply: string; toolsUsed: string[]; held?: { id: string; echo: string } };
 
 // Mesh routing telemetry — the live deploy discriminator (queryable system row,
 // never enters brain history). Best-effort: observability must never block a turn.
@@ -272,40 +270,42 @@ async function emitRoute(party: string, domain: Domain, reason: string, scoped: 
 // Jensen was asked; the model answers it through confirm_pending_action, which
 // re-checks every rule in code. Meaning comes from the model, safety from code.
 export async function confirmRouter(ctx: {
-  party: string; lastUser: string; inboundId?: string | null; swipeQuoted?: string | null;
-}): Promise<{ reply: string | null; open: PendingAction | null }> {
+  party: string; lastUser: string; inboundId?: string | null; channel?: string;
+}): Promise<{ reply: string | null; open: PendingAction | null; held?: { id: string; echo: string } }> {
   const kind = classifyReply(ctx.lastUser);
-  const open = await offerPending(ctx.party, ctx.inboundId);
-  if (!open) {
-    // A retry of a message that already confirmed something: say so, rather than
-    // letting the model re-hold (and maybe re-send) the same action.
-    if (kind === "yes" && (await handledBy(ctx.party, ctx.inboundId))) return { reply: "That's already done.", open: null };
-    return { reply: null, open: null };
+
+  if (ctx.channel === "portal") {
+    // Portal: a synchronous screen with no scheduled pushes landing in it, so the
+    // next portal message answers the question shown right above it.
+    const open = await offerPending(ctx.party, ctx.inboundId, "portal");
+    if (!open) return { reply: null, open: null };
+    if (!(await lastOutboundCarries(ctx.party, open.echo, "portal"))) {
+      await cancelPending(open.id);
+      return { reply: null, open: null };
+    }
+    if (kind === "no") { await cancelPending(open.id); return { reply: "Left it as it is.", open: null }; }
+    if (kind === "yes") {
+      const claimed = await claimPending(open.id, ctx.inboundId);
+      if (!claimed) return { reply: null, open: null };
+      const x = await executePending(claimed, { party: ctx.party, inboundId: ctx.inboundId });
+      return { reply: x.outcome, open: null };
+    }
+    return { reply: null, open };
   }
 
-  // The held question must still be the LAST thing he was sent. A reminder, mail
-  // alert or brief that went out after it means his "ok" may be about THAT, so the
-  // held action lapses (review 2 blocker: "ok" to "Upaya call in 5 minutes" sent
-  // the held email). Likewise a swipe-reply that quotes some other message.
-  const stillLast = await lastOutboundCarries(ctx.party, open.echo);
-  const swipedElsewhere = !!ctx.swipeQuoted && !sameText(ctx.swipeQuoted).includes(sameText(open.echo).slice(0, 40));
-  if (!stillLast || swipedElsewhere) {
-    await cancelPending(open.id);
-    return { reply: null, open: null };
-  }
-
-  if (kind === "no") {
+  // WhatsApp: NOTHING executes from typed text. A held action runs only on a tap of
+  // its own button, handled in the webhook before this. Typed replies are only
+  // intercepted when the button message is the last thing he was sent, and then
+  // only harmlessly: "yes" gets the buttons again, "no" cancels (nothing happens).
+  const open = await findOpenHold(ctx.party, "whatsapp");
+  if (!open) return { reply: null, open: null };
+  const answeringButtons = await lastOutboundCarries(ctx.party, open.echo, "whatsapp");
+  if (answeringButtons && kind === "no") {
     await cancelPending(open.id);
     return { reply: "Left it as it is.", open: null };
   }
-  if (kind === "yes") {
-    const claimed = await claimPending(open.id, ctx.inboundId);
-    if (!claimed) {
-      if (await handledBy(ctx.party, ctx.inboundId)) return { reply: "That's already done.", open: null };
-      return { reply: null, open: null };
-    }
-    const x = await executePending(claimed, { party: ctx.party, inboundId: ctx.inboundId });
-    return { reply: x.outcome, open: null };
+  if (answeringButtons && kind === "yes") {
+    return { reply: "Tap Yes on the message below to confirm.", open: null, held: { id: open.id, echo: open.echo } };
   }
   return { reply: null, open };
 }
@@ -316,11 +316,11 @@ export async function confirmRouter(ctx: {
 function sameText(t: string): string {
   return stripDashes(String(t || "")).replace(/\s+/g, " ").trim().toLowerCase();
 }
-async function lastOutboundCarries(party: string, echo: string): Promise<boolean> {
+async function lastOutboundCarries(party: string, echo: string, channel: string): Promise<boolean> {
   try {
     const rows = await sbSelect<{ content: string }>(
       "chat_messages",
-      `select=content&party=eq.${enc(party)}&role=eq.assistant&order=ts.desc&limit=1`,
+      `select=content&party=eq.${enc(party)}&role=eq.assistant&channel=eq.${enc(channel)}&order=ts.desc&limit=1`,
     );
     return sameText(rows?.[0]?.content || "").includes(sameText(echo));
   } catch {
@@ -340,14 +340,14 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // the model never runs. Otherwise any open question rides into the prompt.
   let openQuestion: PendingAction | null = null;
   try {
-    const routed = await confirmRouter({ party, lastUser, inboundId: input.inboundId, swipeQuoted: input.swipeAnchor?.quotedExcerpt ?? null });
+    const routed = await confirmRouter({ party, lastUser, inboundId: input.inboundId, channel: input.channel });
     if (routed.reply) {
       const chOut = input.channel || "portal";
       try {
         if (lastUser && chOut !== "whatsapp") await ops.chatAppend("user", lastUser, chOut, party);
         await ops.chatAppend("assistant", routed.reply, chOut, party);
       } catch { /* logging must never block the reply */ }
-      return { reply: routed.reply, toolsUsed: [] };
+      return { reply: routed.reply, toolsUsed: [], held: routed.held };
     }
     openQuestion = routed.open;
   } catch { /* fail-safe: a router fault leaves the turn to the model; nothing held executes */ }
@@ -385,9 +385,9 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
 
   const convo: Turn[] = history.map((m) => ({ role: m.role, content: m.content }));
   const runs: { name: string; ok: boolean; result?: any }[] = [];
-  // The exact question a destructive tool was held on this turn. Code, not the model,
-  // puts it at the end of the reply, so what he answers is always what will run.
-  let heldEcho: string | null = null;
+  // The question a destructive tool was held on this turn. Code shows it, never the
+  // model: WhatsApp gets it as Yes / No buttons (webhook), the portal as the last line.
+  let held: { id: string; echo: string } | null = null;
   let reply = "";
   // Skeptic #1/#2/#5: a single owner "yes" must not unlock a BATCH of destructive
   // actions. At most ONE destructive tool executes per turn; a 2nd is refused and
@@ -457,14 +457,9 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
           }
           destructiveUsedThisTurn++;
         }
-        const r = await runAction(tu.name, tu.input || {}, { party, lastUser, inboundId: input.inboundId, priorRuns: runs.length });
+        const r = await runAction(tu.name, tu.input || {}, { party, lastUser, inboundId: input.inboundId, priorRuns: runs.length, channel: input.channel === "portal" ? "portal" : "whatsapp" });
         runs.push({ name: tu.name, ok: r.ok, result: r.ok ? r.result : { summary: r.error } });
-        if (r.held) heldEcho = r.held.echo;
-        // A confirmation executes a DIFFERENT tool (the held delete/send). Record that
-        // tool as run too, so the honesty rail sees "removed all 4" as backed.
-        if (tu.name === "confirm_pending_action" && r.ok && r.result?.executed_tool) {
-          runs.push({ name: r.result.executed_tool, ok: true, result: r.result.result });
-        }
+        if (r.held) held = r.held;
         toolResults.push({
           type: "tool_result",
           tool_use_id: tu.id,
@@ -484,10 +479,12 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
   // JENSEN-DOCTRINE Law 5 enforcement — strip every em/en dash from the reply
   // BEFORE persisting + delivery. Same canonical form lands in chat_messages
   // and on the user's WhatsApp. Belt-and-braces with the chokepoint in sendWhatsApp.
-  if (heldEcho) {
-    // The question goes last and verbatim. The model's own wording of it (if any)
-    // is removed so he is never asked twice in one message.
-    reply = `${reply.split(heldEcho).join("").trim()}\n\n${heldEcho}`.trim();
+  if (held) {
+    // Never asked twice: drop any copy of the question the model wrote itself.
+    reply = reply.split(held.echo).join("").trim();
+    // Portal: shown as the last line of the same reply, answered by the next message.
+    // WhatsApp: the webhook sends it as buttons right after this reply.
+    if ((input.channel || "portal") === "portal") reply = `${reply}\n\n${held.echo}\nReply yes to confirm.`.trim();
   }
   reply = stripDashes(reply);
 
@@ -511,5 +508,5 @@ export async function runConcierge(input: { messages: { role: "user" | "assistan
     } catch { /* best-effort, the reply already shipped */ }
   }
 
-  return { reply, toolsUsed: runs.map((r) => r.name) };
+  return { held: held ?? undefined, reply, toolsUsed: runs.map((r) => r.name) };
 }

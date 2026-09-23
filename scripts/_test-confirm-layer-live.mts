@@ -4,15 +4,18 @@
 // Uses the scratch party "selftest". The router only ever looks up "jensen" and
 // "taona", so nothing here can reach Jensen or execute anything. Every row it
 // writes is deleted at the end. Exits non-zero on any failure.
-import { proposePending, offerPending, claimPending, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
+import { proposePending, offerPending, claimPending, claimByTap, holdStatus, markExecuted, cancelPending } from "../lib/concierge/pending-actions";
+import { sbUpdate } from "../lib/concierge/rest";
 import { sbSelect, sbDelete } from "../lib/concierge/rest";
 
 const P = "selftest";
 const scratch = "key=like." + encodeURIComponent(`pending_action:${P}:*`);
 let failed = 0;
 const ok = (c: boolean, m: string) => { console.log((c ? "PASS " : "FAIL ") + m); if (!c) failed++; };
-const hold = (tool: string, args: any, inbound: string) =>
-  proposePending({ party: P, tool, args, echo: `test ${tool}`, proposedText: "stop the reminders", proposedInboundId: inbound });
+// The portal cases exercise the text path (offerPending / claimPending); the tap
+// cases exercise WhatsApp, where only a button tap can run a held action.
+const hold = (tool: string, args: any, inbound: string, channel = "portal") =>
+  proposePending({ party: P, tool, args, echo: `test ${tool}`, proposedText: "stop the reminders", proposedInboundId: inbound, channel });
 
 try {
   // --- the happy path: asked in X, answered in Y ---
@@ -52,6 +55,21 @@ try {
   const d1 = await hold("delete_event", { ids: ["x"] }, "wamid.D1");
   const d2 = await hold("delete_event", { ids: ["x"] }, "wamid.D2");
   ok(d1?.id === d2?.id, "asking for the identical action twice holds ONE thing, not two");
+  // --- WhatsApp: only a tap on the action's own button runs it ---
+  const w = await hold("delete_event", { ids: ["w1", "w2"] }, "wamid.W1", "whatsapp");
+  ok(w?.channel === "whatsapp", "a WhatsApp hold is bound to WhatsApp");
+  ok((await claimByTap(w!.id, "someone-else", "wamid.TAP0")) === null, "a tap from another party cannot claim it");
+  const portalHold = await hold("delete_note", { id: "pn" }, "wamid.PN", "portal");
+  ok((await claimByTap(portalHold!.id, P, "wamid.TAPP")) === null, "a WhatsApp tap cannot claim a PORTAL hold");
+  const taps = await Promise.all([claimByTap(w!.id, P, "wamid.TAP1"), claimByTap(w!.id, P, "wamid.TAP2")]);
+  ok(taps.filter(Boolean).length === 1, "a double tap executes exactly once");
+  await markExecuted(w!.id, { ok: true, result: { deleted: ["w1", "w2"] } });
+  ok((await holdStatus(w!.id))?.status === "executed", "a later tap on the same button reads 'already done' from the record");
+  const old = await hold("call_owner", { message: "late" }, "wamid.OLD", "whatsapp");
+  const rows = await sbSelect<{ key: string; value: any }>("kv", `select=key,value&key=like.${encodeURIComponent(`pending_action:${P}:*`)}&limit=50`);
+  const row = rows.find((r) => r.value.id === old!.id)!;
+  await sbUpdate("kv", `key=eq.${encodeURIComponent(row.key)}`, { value: { ...row.value, expires_at: new Date(Date.now() - 1000).toISOString() }, updated_at: Date.now() });
+  ok((await claimByTap(old!.id, P, "wamid.TAPLATE")) === null, "a tap on an EXPIRED button runs nothing");
 } finally {
   await sbDelete("kv", scratch);
   const left = await sbSelect("kv", `select=key&${scratch}`);

@@ -21,10 +21,6 @@ export type Domain = "calendar" | "tasks" | "docs" | "comms" | "money" | "genera
 // stays here on the never-worse rule). Everything else moved to the lane(s) that
 // actually use it; `general` (full toolset) still exposes all of them on ambiguity.
 const CROSS_CUTTING = [
-  // confirm_pending_action answers a held delete/send. It must exist in EVERY lane:
-  // "stop them" routes to whatever lane its words suggest, and if the tool is not
-  // there the model cannot confirm and the held action silently lapses.
-  "confirm_pending_action",
   // set_reminder: "remind me" can arrive in any lane's words, and without it the
   // model falls back to create_task, which never pings him.
   "set_reminder",

@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { sendWhatsApp, isOwner, whoIs, mirrorInbound } from "@/lib/whatsapp";
-import { sendTextAndLog } from "@/lib/sendTextAndLog";
+import { sendTextAndLog, sendButtonsAndLog } from "@/lib/sendTextAndLog";
 import { runConcierge } from "@/lib/concierge/loop";
-import { sendFiledDocument } from "@/lib/concierge/dispatch";
+import { sendFiledDocument, executePending } from "@/lib/concierge/dispatch";
+import { claimByTap, cancelPending, holdStatus } from "@/lib/concierge/pending-actions";
 import { kvGet, kvSet, admin } from "@/lib/db";
 import * as ops from "@/lib/concierge/ops";
 import { classifyAndFile } from "@/lib/concierge/intake";
@@ -112,18 +113,49 @@ async function recentHistory(party: string): Promise<{ role: "user" | "assistant
   }
 }
 
-// The event Jensen was most recently pinged about, if that ping is recent and
-// unambiguous. Null when there is none in the last 3 hours, or when the two most
-// recent pings are within 20 minutes of each other (then "done" could mean either).
+// The event Jensen was most recently pinged about, if his "done" can only mean it.
+// Null (so the brain resolves it from the thread) when:
+//  - no reminder fired in the last 3 hours;
+//  - that reminder is not the LAST thing he was sent (he may be answering
+//    something newer: review 3, finding 4);
+//  - it is part of a series with more pings still to come ("done" could mean this
+//    one or all of them; the DJ chase was titled "... (reminder 2)", "(reminder 4)").
 async function pingedJustNow(): Promise<{ id: string; title: string } | null> {
   const since = Date.now() - 3 * 3_600_000;
   const rows = await sbSelect<{ id: string; title: string; reminded_at: number }>(
     "events",
-    `select=id,title,reminded_at&reminded_at=gte.${since}&outcome=is.null&order=reminded_at.desc&limit=2`,
+    `select=id,title,reminded_at&reminded_at=gte.${since}&outcome=is.null&order=reminded_at.desc&limit=1`,
   );
-  if (!rows.length) return null;
-  if (rows.length > 1 && Number(rows[0].reminded_at) - Number(rows[1].reminded_at) < 20 * 60_000) return null;
-  return { id: rows[0].id, title: rows[0].title };
+  const ev = rows?.[0];
+  if (!ev) return null;
+  const last = await sbSelect<{ content: string }>(
+    "chat_messages",
+    `select=content&party=eq.jensen&role=eq.assistant&channel=eq.whatsapp&order=ts.desc&limit=1`,
+  );
+  if (!String(last?.[0]?.content || "").startsWith(`Reminder. ${ev.title} at`)) return null;
+  const base = ev.title.replace(/\s*\(reminder \d+\)\s*$/i, "").trim();
+  const today = new Date(Date.now() + 4 * 3_600_000).toISOString().slice(0, 10);
+  const more = await sbSelect<{ id: string }>(
+    "events",
+    `select=id&title=ilike.${enc(base + "*")}&reminded_at=is.null&outcome=is.null&date=gte.${today}&id=neq.${enc(ev.id)}&limit=1`,
+  );
+  if (more.length) return null;
+  return { id: ev.id, title: ev.title };
+}
+
+// A held destructive action, sent as Yes / No buttons. WhatsApp caps an
+// interactive body at 1024 chars, so a longer question (a full email body, a long
+// list) goes first as a normal message and the buttons refer to it.
+async function sendConfirmButtons(to: string, held: { id: string; echo: string }, party: string): Promise<void> {
+  let body = held.echo;
+  if (body.length > 1000) {
+    await sendTextAndLog(to, body, { party });
+    body = "Confirm what I just sent above?";
+  }
+  await sendButtonsAndLog(to, body, [
+    { id: `pa:${held.id}:yes`, title: "Yes" },
+    { id: `pa:${held.id}:no`, title: "No, keep it" },
+  ], { party });
 }
 
 export async function POST(req: NextRequest) {
@@ -264,6 +296,38 @@ export async function POST(req: NextRequest) {
     }
 
     const sender = whoIs(from);
+
+    // CONFIRMATION TAP (ADR-0002 Phase 1, v4). The ONLY way a held destructive
+    // action runs on WhatsApp. The button id names the exact held action, so this
+    // is not a guess about what a typed "yes" meant. Handled before the coalescer
+    // and the brain so nothing can reinterpret it.
+    const tapId = msg.type === "interactive" && msg.interactive?.type === "button_reply" ? String(msg.interactive.button_reply?.id || "") : "";
+    const tap = /^pa:([0-9a-f-]{36}):(yes|no)$/i.exec(tapId);
+    if (tap) {
+      const tapParty = sender.role !== "owner" ? "taona" : "jensen";
+      const [, holdId, choice] = tap;
+      await ops.chatAppend("user", `[tapped: ${choice.toLowerCase() === "yes" ? "Yes" : "No, keep it"}]`, "whatsapp", tapParty, { externalId: inboundWamid }).catch(() => {});
+      let out: string;
+      if (choice.toLowerCase() === "no") {
+        const h = await holdStatus(holdId);
+        if (h && h.status === "pending" && h.party === tapParty) { await cancelPending(holdId); out = "Left it as it is."; }
+        else out = h?.status === "executed" ? "That was already done." : "Nothing to cancel there.";
+      } else {
+        const claimed = await claimByTap(holdId, tapParty, inboundWamid || `tap:${Date.now()}`);
+        if (claimed) {
+          out = (await executePending(claimed, { party: tapParty, inboundId: inboundWamid })).outcome;
+        } else {
+          const h = await holdStatus(holdId);
+          out = !h || h.party !== tapParty ? "I can't find that request any more. Ask me again."
+            : h.status === "executed" ? "That was already done."
+            : h.status === "cancelled" ? "That one was cancelled. Ask me again if you still want it."
+            : "That request expired. Ask me again and I'll set it up fresh.";
+        }
+      }
+      await sendTextAndLog(from, out, { party: tapParty });
+      return NextResponse.json({ ok: true });
+    }
+
     // OPERATOR MIRROR (silent, never shown to the sender). Forward Jensen's inbound
     // to Taona's number so he can live-tail conversations. Only the principal's
     // (owner's) inbound is mirrored; the operator's own messages are never echoed
@@ -294,8 +358,9 @@ export async function POST(req: NextRequest) {
       const party = sender.role !== "owner" ? "taona" : "jensen";
       // Persist with a [voice note] marker so chat history shows it came as audio.
       await ops.chatAppend("user", `[voice note] ${transcript}`, "whatsapp", party, { externalId: inboundWamid }).catch(() => {});
-      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: transcript }], channel: "whatsapp", sender, inboundId: inboundWamid });
-      await sendWhatsApp(from, reply || "I'm here.");
+      const { reply, held } = await runConcierge({ messages: [...history, { role: "user", content: transcript }], channel: "whatsapp", sender, inboundId: inboundWamid });
+      if (reply?.trim() || !held) await sendWhatsApp(from, reply || "I'm here.");
+      if (held) await sendConfirmButtons(from, held, party);
       return NextResponse.json({ ok: true });
     }
 
@@ -571,8 +636,8 @@ export async function POST(req: NextRequest) {
     const doneEligible = sender.role === "owner" || process.env.JENSEN_MODE === "TRAINING";
     if (doneEligible && !swipeAnchor && /^(done|done\.|did it|yes done|handled|marked done)$/i.test(cleaned)) {
       const target = await pingedJustNow().catch(() => null);
-      if (target) {
-        await ops.completeEvent({ id: target.id }).catch(() => {});
+      const closed = target ? await ops.completeEvent({ id: target.id }).then(() => true, () => false) : false;
+      if (target && closed) {
         await ops.chatAppend("user", text, "whatsapp", "jensen", { externalId: inboundWamid }).catch(() => {});
         const reply = `Done. Marked "${target.title}" complete.`;
         await ops.chatAppend("assistant", reply, "whatsapp", "jensen").catch(() => {});
@@ -635,8 +700,9 @@ export async function POST(req: NextRequest) {
     // log the error to the audit channel so the operator sees it. The inbound
     // is already persisted above (NO-CHAT-LOST), so nothing is lost either way.
     try {
-      const { reply } = await runConcierge({ messages: [...history, { role: "user", content: turnInput }], channel: "whatsapp", sender, swipeAnchor, inboundId: inboundWamid });
-      await sendWhatsApp(from, reply || "I'm here.");
+      const { reply, held } = await runConcierge({ messages: [...history, { role: "user", content: turnInput }], channel: "whatsapp", sender, swipeAnchor, inboundId: inboundWamid });
+      if (reply?.trim() || !held) await sendWhatsApp(from, reply || "I'm here.");
+      if (held) await sendConfirmButtons(from, held, inboundParty);
     } catch (brainErr: any) {
       await sendWhatsApp(
         from,
