@@ -9,7 +9,9 @@
 // cron existed) so they do not double-fire alongside the parent event.
 
 import { NextRequest, NextResponse } from "next/server";
-import { sendTextAndLog } from "@/lib/sendTextAndLog";
+import { sendTextAndLog, sendTemplateAndLog } from "@/lib/sendTextAndLog";
+import { isInWindow } from "@/lib/whatsapp-window";
+import { reminderPlan, REMINDER_TEMPLATE, REMINDER_TEMPLATE_LANG } from "@/lib/concierge/reminder-plan.mjs";
 import { whoIs } from "@/lib/whatsapp";
 import { dubaiToday } from "@/lib/time";
 import { sbSelect, sbUpdate, sbInsert, enc } from "@/lib/concierge/rest";
@@ -85,11 +87,16 @@ async function handle(req: NextRequest) {
     return d.toISOString().slice(0, 10);
   }
 
+  // Past 24h since his last message, free text is never delivered: use the
+  // approved template (FM-21). Fails closed: if the window can't be read, template.
+  const win = await isInWindow("jensen");
+
   const fired: any[] = [];
   for (const ev of due) {
     // Surface the meeting link AT reminder time (the thing he actually wanted).
     // It was saved on the event but the reminder never showed it (Sotiris, Jun 16).
-    const body = `Reminder. ${ev.title} at ${ev.time}.${ev.meeting_url ? `\nHere is your link to join: ${ev.meeting_url}` : ""}`;
+    // Only the text path can carry it; the template invites him to reply for it.
+    const plan = reminderPlan(ev, win);
     // CLAIM the reminder BEFORE sending. If we sent first and the reminded_at
     // latch then failed, the event would re-match reminded_at=is.null every tick
     // and spam the same reminder forever. At-most-once: only send after we have
@@ -97,10 +104,16 @@ async function handle(req: NextRequest) {
     const latched = await sbUpdate("events", `id=eq.${enc(ev.id)}`, { reminded_at: Date.now() })
       .then(() => true).catch(() => false);
     if (!latched) continue;
+    let mode: string = plan.mode;
     for (const num of to) {
-      await sendTextAndLog(num, body, { force: true, party: "jensen" });
+      if (plan.mode === "template") {
+        const r = await sendTemplateAndLog(num, REMINDER_TEMPLATE, REMINDER_TEMPLATE_LANG, plan.params, plan.text, { force: true, party: "jensen" });
+        if (r.ok) continue;
+        mode = "template-failed-text"; // no worse than before FM-21, and lands if the window is in fact open
+      }
+      await sendTextAndLog(num, plan.mode === "template" ? plan.fallbackText : plan.text, { force: true, party: "jensen" });
     }
-    fired.push({ id: ev.id, title: ev.title, time: ev.time });
+    fired.push({ id: ev.id, title: ev.title, time: ev.time, mode, hoursSince: Number(win.hoursSince.toFixed(1)) });
 
     // Recurring: create the next occurrence if recurrence is set and not past until.
     if (ev.recurrence && ["weekly", "monthly", "yearly"].includes(ev.recurrence)) {

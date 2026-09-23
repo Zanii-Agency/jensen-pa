@@ -11,7 +11,7 @@
 // reaskPhrase and the catch is logged for engineering review. The wall is
 // in code; the rules are in lib/bot/guards-config.ts.
 
-import { sendWhatsApp, sendWhatsAppRaw, sendWhatsAppInteractive, devPhone } from "@/lib/whatsapp";
+import { sendWhatsApp, sendWhatsAppRaw, sendWhatsAppInteractive, sendWhatsAppTemplate, devPhone } from "@/lib/whatsapp";
 import { admin } from "@/lib/db";
 import { sanitizeReply } from "@/lib/bot-guards/index.js";
 import { JENSEN_BOT_GUARDS_CONFIG } from "@/lib/bot/guards-config";
@@ -130,4 +130,43 @@ export async function sendButtonsAndLog(
     try { await admin().from("chat_messages").update({ external_id: r.wamid }).eq("id", rowId); } catch { /* best effort */ }
   }
   return { ok: true };
+}
+
+// The chokepoint for approved templates: the only messages Meta delivers more than
+// 24h after his last message (FM-21). `text` is the template body with its
+// parameters filled in, i.e. exactly what he reads; that is what the transcript
+// records. The wall runs on it like any other message: if it would drop, nothing
+// is sent here and the caller falls back to sendTextAndLog, which pages the
+// developer. Law 10: dev sends go to the developer phone and are not logged.
+export async function sendTemplateAndLog(
+  to: string,
+  name: string,
+  lang: string,
+  params: string[],
+  text: string,
+  opts?: { force?: boolean; party?: string; dev?: boolean },
+): Promise<{ ok: boolean; dropped?: boolean }> {
+  if (sanitizeReply(text, JENSEN_BOT_GUARDS_CONFIG).dropped) return { ok: false, dropped: true };
+  if (opts?.dev) {
+    const target = devPhone();
+    if (!target) return { ok: false };
+    return { ok: !!(await sendWhatsAppTemplate(target, name, lang, params, { force: true })) };
+  }
+  const ins = await admin().from("chat_messages").insert({
+    role: "assistant",
+    content: text,
+    channel: "whatsapp",
+    party: opts?.party ?? "jensen",
+    ts: Date.now(),
+  }).select("id").single();
+  const rowId: number | null = (ins?.data as any)?.id ?? null;
+  const wamid = await sendWhatsAppTemplate(to, name, lang, params, { force: opts?.force });
+  if (rowId != null) {
+    try {
+      await admin().from("chat_messages")
+        .update(wamid ? { external_id: wamid } : { content: `${text}\n[template NOT sent]` })
+        .eq("id", rowId);
+    } catch { /* best effort */ }
+  }
+  return { ok: !!wamid };
 }

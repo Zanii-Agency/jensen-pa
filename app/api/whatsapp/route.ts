@@ -18,7 +18,7 @@ import { extractMeetingLink, extractAnyUrl, resolveEventByIdentity, dispatchMeet
 import { parkLink } from "@/lib/pending-links";
 import { shouldProcess, mediaArrived } from "@/lib/brain-core/index.js";
 import { coalesceTurn, finishTurn } from "@/lib/whatsapp-coalesce";
-import { parseStatuses, shouldApplyStatus } from "@/lib/concierge/wa-delivery.mjs";
+import { parseStatuses, shouldApplyStatus, deliveryFailedAudit } from "@/lib/concierge/wa-delivery.mjs";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -201,6 +201,13 @@ export async function POST(req: NextRequest) {
     if (statuses.length) {
       try {
         for (const s of statuses) {
+          if (s.status === "failed") {
+            // FM-21: a message Meta accepted but could not deliver (e.g. free text
+            // after his 24h window closed). Visible as an audit row, see wa-delivery.
+            const { data: hit } = await admin().from("chat_messages").select("party,content").eq("external_id", s.wamid).limit(1);
+            const r = Array.isArray(hit) ? hit[0] : null;
+            if (r) await admin().from("chat_messages").insert({ role: "system", channel: "audit", party: r.party, content: deliveryFailedAudit(s, r), ts: Date.now() });
+          }
           const { data } = await admin()
             .from("chat_messages")
             .select("id,delivery_status")

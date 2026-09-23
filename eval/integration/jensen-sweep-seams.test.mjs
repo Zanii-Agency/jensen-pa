@@ -194,8 +194,11 @@ check("seam.33 chatAppend idempotent on external_id (no double-save)", () => {
 });
 
 check("seam.34 reminder surfaces the meeting link at reminder time", () => {
+  // FM-21 moved the wording into reminder-plan.mjs (window-aware); the link rides the text path.
   const src = read("app/api/cron/reminders/route.ts");
-  if (!/ev\.meeting_url/.test(src)) return "reminder body does not include the meeting link";
+  const plan = read("lib/concierge/reminder-plan.mjs");
+  if (!src.includes("reminderPlan(ev, win)")) return "reminder cron no longer builds its message with reminderPlan";
+  if (!/ev\.meeting_url/.test(plan)) return "reminder body does not include the meeting link";
   return null;
 });
 
@@ -1214,7 +1217,8 @@ check("seam.66 CHARACTERIZATION: reminder cron still fires due events at T-5 + l
   if (!/delta >= LEAD_MIN - WINDOW && delta <= LEAD_MIN \+ WINDOW/.test(src)) return "cron no longer uses the [4,6]-min lead window";
   if (!/\/\^Reminder:\/i\.test\(ev\.title\)/.test(src)) return "cron no longer skips legacy 'Reminder:' rows";
   const latchIdx = src.indexOf("reminded_at: Date.now()");
-  const sendIdx = src.indexOf("sendTextAndLog(num, body");
+  const sends = ["sendTemplateAndLog(num", "sendTextAndLog(num"].map((t) => src.indexOf(t)).filter((i) => i >= 0);
+  const sendIdx = sends.length ? Math.min(...sends) : -1;
   if (latchIdx < 0 || sendIdx < 0 || latchIdx > sendIdx) return "cron no longer latches reminded_at BEFORE send (at-most-once broken)";
   return null;
 });
@@ -1222,6 +1226,22 @@ check("seam.66 CHARACTERIZATION: reminder cron still fires due events at T-5 + l
 check("seam.67 reminder cron does NOT fire for completed events (outcome filter) — FM-23 / FM-09 reborn", () => {
   const src = read("app/api/cron/reminders/route.ts");
   if (!/outcome=is\.null/.test(src)) return "cron select missing outcome=is.null — fires reminders for events Jensen already marked done";
+  return null;
+});
+
+check("seam.112 reminders past his 24h window go as the approved template, logged, failures visible (FM-21)", () => {
+  const src = read("app/api/cron/reminders/route.ts");
+  const chk = read("lib/sendTextAndLog.ts");
+  const hook = read("app/api/whatsapp/route.ts");
+  const health = read("app/api/health/wall-drops/route.ts");
+  if (!src.includes('isInWindow("jensen")')) return "reminder cron no longer checks the 24h window";
+  if (!src.includes("sendTemplateAndLog(num, REMINDER_TEMPLATE")) return "off-window reminders no longer use the template";
+  if (!/export async function sendTemplateAndLog/.test(chk)) return "template sender left the Law 2 chokepoint";
+  const t = chk.slice(chk.indexOf("export async function sendTemplateAndLog"));
+  if (t.indexOf(".insert(") < 0 || t.indexOf(".insert(") > t.indexOf("await sendWhatsAppTemplate(to")) return "template is not logged BEFORE it is sent (Law 2)";
+  if (!/sanitizeReply\(text/.test(t)) return "template text skips the send wall";
+  if (!hook.includes('s.status === "failed"') || !hook.includes("deliveryFailedAudit(s, r)")) return "Meta 'failed' reports are discarded again";
+  if (!health.includes("content.like.delivery_failed*")) return "health endpoint no longer counts failed deliveries";
   return null;
 });
 
