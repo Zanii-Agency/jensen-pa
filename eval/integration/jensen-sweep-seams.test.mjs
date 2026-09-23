@@ -872,6 +872,28 @@ check("seam.89 confirming never swallows the rest of the turn ('yes, and book 3p
   return null;
 });
 
+check("seam.90 the confirm layer stores in kv, a table that EXISTS — not a pending_actions table nobody can create (no DDL on Jensen's Supabase)", () => {
+  const pa = read("lib/concierge/pending-actions.ts");
+  // If this is repointed at a table that does not exist, every function silently
+  // fails safe and the bug it fixes (the 16-Sep DJ loop) quietly comes back.
+  if (/["']pending_actions["']/.test(pa)) return "pending-actions.ts references a pending_actions table; that table does not exist and cannot be created -> the layer would fail-safe forever";
+  if (!/sbInsert\("kv"/.test(pa)) return "proposals are not written to kv";
+  if (!/sbUpdateReturning/.test(pa)) return "the claim is not an atomic returning PATCH; two confirmations could both execute";
+  if (!/value->>status=eq\.pending/.test(pa)) return "the claim is not guarded on status=pending";
+  return null;
+});
+
+check("seam.91 the monitor reads wall drops through a count-only endpoint with its OWN token (never CRON_SECRET, never message bodies)", () => {
+  const src = read("app/api/health/wall-drops/route.ts");
+  if (!/HEALTH_READ_TOKEN/.test(src)) return "endpoint is not gated by its dedicated read token";
+  if (/process\.env\.CRON_SECRET/.test(src)) return "endpoint accepts CRON_SECRET; a monitor must never hold a credential that can trigger sends";
+  if (!/status: 503/.test(src)) return "endpoint does not fail closed when its token is unset";
+  if (/content:\s*r\.content|body:/.test(src)) return "endpoint may return message content; it must return counts and guard labels only";
+  const mw = read("middleware.ts");
+  if (!/"\/api\/health"/.test(mw)) return "/api/health is behind the cookie wall; the monitor would get a /login redirect";
+  return null;
+});
+
 check("seam.63 emailed meeting links reach the event row (meetingUrl threads inbox->route->addEmailEvent->addEvent) (KT #342)", () => {
   // addEvent must actually WRITE meeting_url (it silently omitted it before)
   const db = read("lib/db.ts");

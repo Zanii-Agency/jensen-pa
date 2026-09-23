@@ -1,14 +1,24 @@
 // ADR-0002 Phase 1 — durable confirm layer (Class C1: model self-confirm).
 //
-// Data access for the `pending_actions` table. The real Law 8 mechanism: the
-// gate writes a PROPOSED row; a DETERMINISTIC confirm-router (not the model)
-// executes it only when a DISTINCT user inbound confirms.
+// The gate writes a PROPOSED action here; a DETERMINISTIC confirm-router (not
+// the model) executes it only when a DISTINCT user inbound confirms.
 //
-// FAIL-SAFE BY CONSTRUCTION: every function catches (including table-absent
-// PGRST205 before the migration runs) and returns null / no-op. So until the
-// migration is applied AND the gate/router are wired, importing or even calling
-// this changes nothing. UNWIRED on this commit — no production code imports it.
-import { sbSelect, sbInsert, sbUpdate, enc } from "./rest";
+// STORAGE: the existing `kv` table, not a dedicated `pending_actions` table.
+// ADR-0002 specified its own table, but nobody who operates this bot has DDL
+// access to Jensen's Supabase project (checked 2026-09-23: no DB URL, no token
+// linked to the project, no SQL-exec RPC). `kv` already exists and the service
+// key already writes it (prefs, goals and the legal blueprint live there), so the
+// confirm layer needs zero schema changes to go live.
+//
+// One row per proposal: key `pending_action:<party>:<id>`, value = the action.
+// The two properties the ADR needs still hold, both proven live on 2026-09-23:
+//   - dedupe of identical open proposals: looked up by value->>args_hash
+//   - atomic claim: a PATCH filtered on value->>status=pending returns the row
+//     only to the caller whose UPDATE matched; two concurrent claims -> one wins
+//
+// FAIL-SAFE BY CONSTRUCTION: every function catches and returns null / no-op,
+// so a storage fault degrades to the gate's previous behaviour, never worse.
+import { sbSelect, sbInsert, sbUpdate, sbUpdateReturning, sbDelete, enc } from "./rest";
 
 export type PendingStatus = "pending" | "confirmed" | "executed" | "expired" | "cancelled";
 export type PendingAction = {
@@ -26,8 +36,17 @@ export type PendingAction = {
   expires_at: string;
 };
 
+const TTL_MS = 30 * 60_000;        // an unconfirmed proposal dies after 30 minutes
+const RETAIN_MS = 24 * 3_600_000;  // finished/expired rows are swept after a day
+const PREFIX = "pending_action:";
+
+const keyFor = (party: string, id: string) => `${PREFIX}${party}:${id}`;
+const partyLike = (party: string) => `key=like.${enc(`${PREFIX}${party}:*`)}`;
+const STATUS_PENDING = `value->>status=eq.pending`;
+const isLive = (a: PendingAction) => !a.expires_at || new Date(a.expires_at).getTime() >= Date.now();
+
 // Stable idempotency key over (tool, sorted args) so logically-identical
-// proposals collide (the unique partial index dedups open ones).
+// proposals collide instead of stacking up.
 export function argsHash(tool: string, args: any): string {
   return `${tool}:${djb2(stableStringify(args ?? {}))}`;
 }
@@ -42,95 +61,116 @@ function djb2(s: string): string {
   return (h >>> 0).toString(36);
 }
 
-// Propose: write a pending row keyed to the proposing inbound. Returns the row,
-// or null if the table is absent / write fails. On a duplicate open proposal
-// (unique partial index) we read back the existing open row so the caller still
-// gets a handle to confirm against.
+// Propose: write a pending action keyed to the proposing inbound. Returns it, or
+// null on any storage fault. An identical proposal that is still open is returned
+// as-is, so asking twice never creates two things to confirm.
 export async function proposePending(input: {
   party: string; tool: string; args: any; proposedInboundId?: string | null;
 }): Promise<PendingAction | null> {
   const hash = argsHash(input.tool, input.args);
   try {
-    const rows = await sbInsert<PendingAction>("pending_actions", {
+    sweep(input.party).catch(() => {});
+    const dup = await sbSelect<{ value: PendingAction }>(
+      "kv",
+      `select=value&${partyLike(input.party)}&${STATUS_PENDING}&value->>args_hash=eq.${enc(hash)}&limit=1`,
+    );
+    const existing = dup?.[0]?.value;
+    if (existing && isLive(existing)) return existing;
+
+    const nowMs = Date.now();
+    const action: PendingAction = {
+      id: crypto.randomUUID(),
       party: input.party,
       tool: input.tool,
       args: input.args ?? {},
       args_hash: hash,
       proposed_inbound_id: input.proposedInboundId ?? null,
       status: "pending",
-    });
-    return rows?.[0] ?? null;
+      confirm_inbound_id: null,
+      result: null,
+      error: null,
+      created_at: new Date(nowMs).toISOString(),
+      expires_at: new Date(nowMs + TTL_MS).toISOString(),
+    };
+    await sbInsert("kv", { key: keyFor(input.party, action.id), value: action, updated_at: nowMs });
+    return action;
   } catch {
-    try {
-      const open = await sbSelect<PendingAction>(
-        "pending_actions",
-        `party=eq.${enc(input.party)}&tool=eq.${enc(input.tool)}&args_hash=eq.${enc(hash)}&status=eq.pending&limit=1`,
-      );
-      return open?.[0] ?? null;
-    } catch { return null; }
+    return null;
   }
 }
 
-// The most recent still-open, non-expired proposal for a party (null if none /
-// table absent). The confirm-router calls this when a user affirmation arrives.
+// The most recent still-open, non-expired proposal for a party, or null.
 export async function findOpenPending(party: string): Promise<PendingAction | null> {
   try {
-    const rows = await sbSelect<PendingAction>(
-      "pending_actions",
-      `party=eq.${enc(party)}&status=eq.pending&order=created_at.desc&limit=1`,
+    const rows = await sbSelect<{ value: PendingAction }>(
+      "kv",
+      `select=value&${partyLike(party)}&${STATUS_PENDING}&order=updated_at.desc&limit=5`,
     );
-    const row = rows?.[0];
-    if (!row) return null;
-    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return null;
-    return row;
-  } catch { return null; }
+    return rows.map((r) => r.value).find(isLive) ?? null;
+  } catch {
+    return null;
+  }
 }
 
-// Confirm + claim. Called by the deterministic confirm-router when a DISTINCT
-// user inbound confirms. The load-bearing invariant (kills same-turn self-confirm):
-// a confirm whose inbound id EQUALS the proposing inbound id is refused. Wins the
-// row via a status=pending-guarded PATCH, then re-reads to prove the claim (no
-// double-execute under concurrency). Returns the claimed row, or null.
+// Confirm + claim, called by the deterministic confirm-router. The load-bearing
+// invariant (kills same-turn self-confirm): a confirm whose inbound id EQUALS the
+// proposing inbound id is refused. The claim itself is a status=pending-guarded
+// PATCH; only the caller whose UPDATE matched gets the row back, so a concurrent
+// or replayed confirmation can never execute the action twice.
 export async function confirmAndClaim(id: string, confirmInboundId: string | null): Promise<PendingAction | null> {
   try {
-    const rows = await sbSelect<PendingAction>("pending_actions", `id=eq.${enc(id)}&limit=1`);
+    const rows = await sbSelect<{ key: string; value: PendingAction }>(
+      "kv",
+      `select=key,value&key=like.${enc(`${PREFIX}*:${id}`)}&limit=1`,
+    );
     const row = rows?.[0];
-    if (!row || row.status !== "pending") return null;
-    if (
-      confirmInboundId != null &&
-      row.proposed_inbound_id != null &&
-      confirmInboundId === row.proposed_inbound_id
-    ) {
-      return null; // SELF-CONFIRM: same inbound proposed and confirmed — not a real user confirmation.
+    const a = row?.value;
+    if (!row || !a || a.status !== "pending" || !isLive(a)) return null;
+    if (confirmInboundId != null && a.proposed_inbound_id != null && confirmInboundId === a.proposed_inbound_id) {
+      return null; // SELF-CONFIRM: the same inbound proposed and confirmed — not a real user confirmation.
     }
-    await sbUpdate("pending_actions", `id=eq.${enc(id)}&status=eq.pending`, {
-      status: "confirmed",
-      confirm_inbound_id: confirmInboundId ?? null,
-    });
-    // Re-read to prove WE won the guarded transition (a concurrent confirm loses).
-    const after = await sbSelect<PendingAction>("pending_actions", `id=eq.${enc(id)}&limit=1`);
-    const claimed = after?.[0];
-    if (claimed && claimed.status === "confirmed" && (claimed.confirm_inbound_id ?? null) === (confirmInboundId ?? null)) {
-      return claimed;
-    }
+    const claimed: PendingAction = { ...a, status: "confirmed", confirm_inbound_id: confirmInboundId ?? null };
+    const won = await sbUpdateReturning<{ value: PendingAction }>(
+      "kv",
+      `key=eq.${enc(row.key)}&${STATUS_PENDING}`,
+      { value: claimed, updated_at: Date.now() },
+    );
+    return won.length === 1 ? won[0].value : null;
+  } catch {
     return null;
-  } catch { return null; }
+  }
 }
 
 // Record the execution outcome after the router runs the tool.
 export async function markExecuted(id: string, outcome: { ok: boolean; result?: any; error?: string }): Promise<void> {
-  try {
-    await sbUpdate("pending_actions", `id=eq.${enc(id)}`, {
-      status: "executed",
-      result: outcome.ok ? (outcome.result ?? null) : null,
-      error: outcome.ok ? null : (outcome.error ?? "failed"),
-    });
-  } catch { /* fail-safe: never block on bookkeeping */ }
+  await patchAction(id, (a) => ({
+    ...a,
+    status: "executed",
+    result: outcome.ok ? (outcome.result ?? null) : null,
+    error: outcome.ok ? null : (outcome.error ?? "failed"),
+  }));
 }
 
-// Cancel an open proposal (e.g. the user said "no").
+// Retire an open proposal (the user said no), so a later unrelated "yes" can
+// never resurrect it.
 export async function cancelPending(id: string): Promise<void> {
+  await patchAction(id, (a) => (a.status === "pending" ? { ...a, status: "cancelled" } : a));
+}
+
+async function patchAction(id: string, next: (a: PendingAction) => PendingAction): Promise<void> {
   try {
-    await sbUpdate("pending_actions", `id=eq.${enc(id)}&status=eq.pending`, { status: "cancelled" });
-  } catch { /* fail-safe */ }
+    const rows = await sbSelect<{ key: string; value: PendingAction }>(
+      "kv",
+      `select=key,value&key=like.${enc(`${PREFIX}*:${id}`)}&limit=1`,
+    );
+    const row = rows?.[0];
+    if (!row?.value) return;
+    await sbUpdate("kv", `key=eq.${enc(row.key)}`, { value: next(row.value), updated_at: Date.now() });
+  } catch { /* fail-safe: bookkeeping never blocks a reply */ }
+}
+
+// kv is shared with prefs/goals, so keep this layer from growing unbounded: any
+// proposal row untouched for a day is finished business. Best-effort.
+async function sweep(party: string): Promise<void> {
+  await sbDelete("kv", `${partyLike(party)}&updated_at=lt.${Date.now() - RETAIN_MS}`);
 }
