@@ -1267,7 +1267,7 @@ check("seam.113 memory judge: meaning-based recall on real turns, ids only, fail
   if (/I already paid him|they moved it, now 11/.test(judge)) return "the judge prompt contains eval answers";
   if (!judge.includes("[...fresh, ...judged.picks, ...older]")) return "his newest keyword hits can be cut by older judge picks";
   if (/my reply then/.test(judge + read("lib/concierge/loop.ts"))) return "the bot's old words are passed on as memory again";
-  if (!/A question or request of his .{0,60}is not a change unless a later line or his calendar shows it happened/.test(read("lib/concierge/loop.ts"))) return "a declined request can read as a change (THINGS HE SAID rule missing)";
+  if (!/A line where he ASKS for a change .{0,80}only shows that he asked, never that it happened/.test(read("lib/concierge/loop.ts"))) return "a declined request can read as a change (THINGS HE SAID rule missing)";
   if (!/api\.anthropic\.com/.test(judge) || /openai/i.test(judge)) return "the judge must use the vetted Anthropic endpoint only (Law 3)";
   return null;
 });
