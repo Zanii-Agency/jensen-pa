@@ -1305,6 +1305,11 @@ check("seam.114 the evening check reaches him on a quiet day, as a template (FM-
   if (!/pendingMailFailed = true/.test(src) || !/readFailed \|\| pendingMailFailed/.test(src)) return "a failed mail read still becomes a confident 0 (Law 6)";
   if (/counts: \{ q1: totalQ1, q2: totalQ2, events: todaysEvents/.test(src)) return "the template counts every event today, not the upcoming ones the brief states (Law 6)";
   if (!src.includes('"template-dropped"') || !src.includes("plan.fallbackText")) return "a wall-killed template has no fallback, so the catch is neither logged nor paged";
+  // Fail closed: a missing env var must disable the template, never fall back to a
+  // hard-coded name. An approved MARKETING template delivers fine, so a default
+  // would silently send one the day the variable is wiped.
+  if (/EVENING_TEMPLATE_DEFAULT/.test(plan)) return "the evening template name has a code default again";
+  if (!/return \(env\?\.EVENING_CHECK_TEMPLATE \?\? ""\)\.trim\(\)/.test(plan)) return "eveningTemplateName does not fail closed on a missing env var";
   return null;
 });
 

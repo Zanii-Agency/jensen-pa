@@ -15,7 +15,6 @@ import { strict as assert } from "node:assert";
 
 import {
   eveningPlan, eveningParams, eveningTemplateText, eveningTemplateName,
-  EVENING_TEMPLATE_DEFAULT,
 } from "../../lib/concierge/evening-plan.ts";
 
 const BRIEF = "Evening check, Jensen. Here is how your board sits.\n\nYou have 3 Q1 items still open.\nReply here anytime if you need me.";
@@ -75,11 +74,12 @@ test("template parameters carry no newlines (Meta rejects them)", () => {
   for (const p of eveningParams(COUNTS)) assert.doesNotMatch(p, /[\n\r\t]/);
 });
 
-test("the template name comes from env, so a Meta rename never needs a deploy", () => {
-  assert.equal(eveningTemplateName({}), EVENING_TEMPLATE_DEFAULT);
-  assert.equal(eveningTemplateName({ EVENING_CHECK_TEMPLATE: " evening_v9 " }), "evening_v9");
-  // Explicitly empty means "not configured": the route records a skip rather than
-  // sending a template name Meta has never seen.
+test("the template name comes ONLY from env, and unset means do not send", () => {
+  // Fail closed: an approved MARKETING template delivers fine, so a code default
+  // would silently send one the day the Vercel variable is wiped. Unset or empty
+  // means the evening check records a skip.
+  assert.equal(eveningTemplateName({}), "");
   assert.equal(eveningTemplateName({ EVENING_CHECK_TEMPLATE: "" }), "");
-  assert.equal(EVENING_TEMPLATE_DEFAULT, "evening_check_v3");
+  assert.equal(eveningTemplateName({ EVENING_CHECK_TEMPLATE: "   " }), "");
+  assert.equal(eveningTemplateName({ EVENING_CHECK_TEMPLATE: " evening_v9 " }), "evening_v9");
 });

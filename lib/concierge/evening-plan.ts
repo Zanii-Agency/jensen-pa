@@ -11,18 +11,38 @@
 // MARKETING, and marketing templates may only go to people who opted in to
 // marketing, which Jensen never did. evening_check_v2 used the morning brief's
 // approved body verbatim and STILL came back MARKETING. evening_check_v3 drops the
-// "Reply here to see the full check" call to action, which is the only part that
-// reads as soliciting engagement rather than reporting his own status. A template
-// whose category is not UTILITY must never be sent to him.
+// "Reply here to see the full check" call to action, the only part that reads as
+// soliciting engagement rather than reporting his own status.
+//
+// FAIL CLOSED ON PURPOSE: the template name comes ONLY from the
+// EVENING_CHECK_TEMPLATE env var, currently "evening_check_v3" on Vercel. There is
+// deliberately no code default. An approved MARKETING template delivers perfectly
+// well, so a default here would silently defeat the rule above the moment the env
+// var is wiped, which is a documented repeat failure mode in this fleet. Unset
+// means the evening check records a skip.
 //
 // Pure, so the wall tests exactly what prod sends.
-export const EVENING_TEMPLATE_DEFAULT = "evening_check_v3"; // approved body: "Evening check, Jensen. {{1}} on your board today, {{2}} I am protecting, {{3}} on schedule, {{4}} email proposals waiting."
+// STATUS 2026-09-24: NO template is configured, on purpose. Meta classified all
+// three submitted wordings as MARKETING, not UTILITY, including one with no call
+// to action, and an approved template's category cannot be changed. Marketing
+// templates may only reach people who opted in to marketing, which Jensen never
+// did, so sending one would risk his business account. The template path below is
+// therefore INERT until someone submits a wording Meta accepts as UTILITY and sets
+// EVENING_CHECK_TEMPLATE. Until then a quiet evening records a visible skip, which
+// is still better than the silent vanish this replaced.
+//
+// The last attempted body, kept so the next attempt starts from it rather than
+// from zero. seam.114 rebuilds it from eveningTemplateText and compares the two
+// strings, so neither side can drift. KEEP THIS ON ONE LINE: the seam reads it as
+// a single string.
+// approved body: "Evening check, Jensen. {{1}} on your board today, {{2}} I am protecting, {{3}} on schedule, {{4}} email proposals waiting."
 export const EVENING_TEMPLATE_LANG = "en_US";
 
-// The name lives in env so a Meta rename never needs a deploy (the morning brief
-// does the same). Empty means "not configured", which the route treats as a skip.
+// The name lives ONLY in env (as MORNING_BRIEF_TEMPLATE does), so a Meta rename
+// never needs a deploy AND a missing variable disables the template instead of
+// sending one whose category nobody has checked.
 export function eveningTemplateName(env: Record<string, string | undefined> = process.env): string {
-  return (env?.EVENING_CHECK_TEMPLATE ?? EVENING_TEMPLATE_DEFAULT).trim();
+  return (env?.EVENING_CHECK_TEMPLATE ?? "").trim();
 }
 
 // Half an hour short of 24h, as in reminder-plan.ts: text sent at 23h59 can be
