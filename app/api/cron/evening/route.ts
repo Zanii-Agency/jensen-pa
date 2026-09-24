@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import * as ops from "@/lib/concierge/ops";
-import { sendTextAndLog } from "@/lib/sendTextAndLog";
+import { sendTextAndLog, sendTemplateAndLog } from "@/lib/sendTextAndLog";
+import { eveningPlan, EVENING_TEMPLATE, EVENING_TEMPLATE_LANG } from "@/lib/concierge/evening-plan";
 import { whoIs } from "@/lib/whatsapp";
 import { dubaiToday } from "@/lib/time";
 import { isInWindow } from "@/lib/whatsapp-window";
@@ -21,7 +22,7 @@ function authed(req: NextRequest): boolean {
   return hdr === `Bearer ${secret}` || key === secret;
 }
 
-async function buildBrief(): Promise<string> {
+async function buildBrief(): Promise<{ text: string; counts: { q1: number; q2: number; events: number; pendingMail: number }; readFailed: boolean }> {
   const today = dubaiToday();
   let readFailed = false;
   const onFail = () => { readFailed = true; return [] as any[]; };
@@ -49,7 +50,7 @@ async function buildBrief(): Promise<string> {
   }
   if (pendingMail) lines.push(`${pendingMail} email${pendingMail > 1 ? "s" : ""} waiting for your reply.`);
   lines.push(`\nReply here anytime if you need me.`);
-  return lines.join("\n");
+  return { text: lines.join("\n"), counts: { q1: totalQ1, q2: totalQ2, events: todaysEvents, pendingMail }, readFailed };
 }
 
 export async function GET(req: NextRequest) {
@@ -58,16 +59,23 @@ export async function GET(req: NextRequest) {
     const prefs = await ops.getPrefs().catch(() => ({} as any));
     if (prefs?.onboarding !== false) return NextResponse.json({ ok: true, skipped: "onboarding" });
 
-    const brief = await buildBrief();
+    const built = await buildBrief();
     const to = owners().filter((n) => whoIs(n).role === "owner");
     const sent: Record<string, any> = {};
 
     for (const n of to) {
       const win = await isInWindow("jensen");
-      if (win.open) {
-        sent[n] = { mode: "text", ok: !!(await sendTextAndLog(n, brief, { party: "jensen" })) };
+      const plan = eveningPlan(built.text, built.counts, win, built.readFailed);
+      if (plan.mode === "skip") {
+        // Recorded, not silent: an evening that never reached him must be visible.
+        sent[n] = { mode: "skipped", reason: plan.reason };
+      } else if (plan.mode === "text") {
+        sent[n] = { mode: "text", ok: !!(await sendTextAndLog(n, plan.text, { party: "jensen" })) };
       } else {
-        sent[n] = { mode: "skipped", reason: "off-window" };
+        const r = await sendTemplateAndLog(n, EVENING_TEMPLATE, EVENING_TEMPLATE_LANG, plan.params, plan.text, { party: "jensen" });
+        // A refused template off-window sends NO free text: Meta would accept it and
+        // never deliver it (FM-21). sendTemplateAndLog logged it and paged the dev.
+        sent[n] = { mode: "template", ok: r.ok, dropped: !!r.dropped };
       }
     }
 

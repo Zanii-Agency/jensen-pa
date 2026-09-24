@@ -1272,6 +1272,23 @@ check("seam.113 memory judge: meaning-based recall on real turns, ids only, fail
   return null;
 });
 
+check("seam.114 the evening check reaches him on a quiet day, as a template (FM-21 sibling)", () => {
+  const src = read("app/api/cron/evening/route.ts");
+  const plan = read("lib/concierge/evening-plan.ts");
+  const chk = read("lib/sendTextAndLog.ts");
+  if (!src.includes("eveningPlan(built.text, built.counts, win, built.readFailed)")) return "evening cron no longer builds its message with eveningPlan";
+  if (!src.includes("sendTemplateAndLog(n, EVENING_TEMPLATE")) return "off-window evening check no longer uses the template";
+  if (/mode: "skipped", reason: "off-window"/.test(src)) return "the evening check still silently vanishes off-window";
+  if (!/if \(readFailed\) return \{ mode: "skip"/.test(plan)) return "a failed read can still produce template numbers (Law 6)";
+  if (!/export async function sendTemplateAndLog/.test(chk)) return "template sender left the Law 2 chokepoint";
+  // The template must exist at Meta and match the params the planner emits.
+  const m = /approved body: "([^"]+)"/.exec(plan);
+  if (!m) return "evening-plan does not record the approved template body";
+  const slots = (m[1].match(/\{\{\d+\}\}/g) || []).length;
+  if (slots !== 4) return `approved body has ${slots} slots, planner emits 4`;
+  return null;
+});
+
 check("seam.68 isOwner FAILS CLOSED when OWNER_WHATSAPP is empty (deny all, never allow-all) — FM-18 single-tenant breach", () => {
   const src = read("lib/whatsapp.ts");
   const i = src.indexOf("export function isOwner");
