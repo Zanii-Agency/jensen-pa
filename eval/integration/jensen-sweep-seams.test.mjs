@@ -1277,15 +1277,34 @@ check("seam.114 the evening check reaches him on a quiet day, as a template (FM-
   const plan = read("lib/concierge/evening-plan.ts");
   const chk = read("lib/sendTextAndLog.ts");
   if (!src.includes("eveningPlan(built.text, built.counts, win, built.readFailed)")) return "evening cron no longer builds its message with eveningPlan";
-  if (!src.includes("sendTemplateAndLog(n, EVENING_TEMPLATE")) return "off-window evening check no longer uses the template";
+  if (!src.includes("sendTemplateAndLog(n, templateName,")) return "off-window evening check no longer uses the template";
   if (/mode: "skipped", reason: "off-window"/.test(src)) return "the evening check still silently vanishes off-window";
   if (!/if \(readFailed\) return \{ mode: "skip"/.test(plan)) return "a failed read can still produce template numbers (Law 6)";
   if (!/export async function sendTemplateAndLog/.test(chk)) return "template sender left the Law 2 chokepoint";
-  // The template must exist at Meta and match the params the planner emits.
-  const m = /approved body: "([^"]+)"/.exec(plan);
-  if (!m) return "evening-plan does not record the approved template body";
-  const slots = (m[1].match(/\{\{\d+\}\}/g) || []).length;
-  if (slots !== 4) return `approved body has ${slots} slots, planner emits 4`;
+
+  // The words he reads must match the body Meta approved. The approved body is
+  // recorded in the planner's comment; rebuild it from eveningTemplateText's
+  // template literal and compare, so neither side can drift.
+  const approved = /approved body: "([^"]+)"/.exec(plan);
+  if (!approved) return "evening-plan does not record the approved template body";
+  const slots = approved[1].match(/\{\{\d+\}\}/g) || [];
+  if (slots.length !== 4) return `approved body has ${slots.length} slots, planner emits 4`;
+  const lit = /export function eveningTemplateText\(params: string\[\]\): string \{\s*return `([^`]+)`/.exec(plan);
+  if (!lit) return "eveningTemplateText is not a single template literal built from params";
+  const rebuilt = lit[1].replace(/\$\{params\[(\d)\]\}/g, (_m, i) => `{{${Number(i) + 1}}}`);
+  if (rebuilt !== approved[1]) return `eveningTemplateText drifts from the approved body: ${rebuilt}`;
+
+  // Observability and idempotency: a missed evening must be visible, and one day
+  // must not send two billed templates.
+  for (const need of ["auditEvening", "eveningAlreadySent", "markEveningSent"]) {
+    if (!src.includes(`function ${need}`)) return `${need} is gone`;
+  }
+  for (const at of ['auditEvening("skip=onboarding")', 'auditEvening("skip=already-sent-today")', "await auditEvening(`error=", "await auditEvening(`${summary}"]) {
+    if (!src.includes(at)) return `no audit row for: ${at}`;
+  }
+  if (!/pendingMailFailed = true/.test(src) || !/readFailed \|\| pendingMailFailed/.test(src)) return "a failed mail read still becomes a confident 0 (Law 6)";
+  if (/counts: \{ q1: totalQ1, q2: totalQ2, events: todaysEvents/.test(src)) return "the template counts every event today, not the upcoming ones the brief states (Law 6)";
+  if (!src.includes('"template-dropped"') || !src.includes("plan.fallbackText")) return "a wall-killed template has no fallback, so the catch is neither logged nor paged";
   return null;
 });
 
