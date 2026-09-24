@@ -625,6 +625,13 @@ export async function runAction(
     if (skipTenantWriteForDev(name, ctx?.party)) {
       return { ok: true, result: { simulated: true, tool: name, persisted: false, note: OUTWARD_SENDS.has(name) ? "Dev/admin turn: nothing was sent (Law 10: test traffic never reaches a real person)." : "Dev/admin turn: not written to Jensen's tenant (single-tenant wall). Change Jensen's real data through his own portal." } };
     }
+    // Two-stage receipt (REQUEST): the concierge was asked to run this action.
+    // Placed after the dev-wall (simulated turns returned above), so only real
+    // Jensen writes. Confirmation fires below. "concierge." prefix distinguishes
+    // these from other agents' identical tool names on the explorer.
+    if (!ZANII_READS.has(name)) {
+      import("../zanii").then(({ recordAction }) => recordAction(`concierge.${name}.requested`, { input: input ?? {} })).catch(() => {});
+    }
     let result: Result;
     switch (name) {
       // entities
@@ -978,10 +985,11 @@ export async function runAction(
     // the tool's own result. Fire-and-forget (waitUntil keeps it alive on Vercel).
     if (!ZANII_READS.has(name)) {
       const actionOk = result?.ok !== false && result?.sent !== false;
-      // Dynamic import keeps the ESM-only @zanii/sdk out of dispatch's static
-      // graph (the eval loader flips to strict-ESM and breaks extensionless
-      // imports otherwise). Fire-and-forget; waitUntil inside keeps it alive.
-      import("../zanii").then(({ recordAction }) => recordAction(name, { input: input ?? {}, ok: actionOk })).catch(() => {});
+      // Two-stage CONFIRMATION: concierge.<tool>.confirmed on a real write,
+      // .failed otherwise. "concierge." prefix makes it distinguishable; the
+      // tool name carries the intent. Dynamic import keeps the ESM-only
+      // @zanii/sdk out of the static graph. Fire-and-forget; waitUntil inside.
+      import("../zanii").then(({ recordAction }) => recordAction(`concierge.${name}.${actionOk ? "confirmed" : "failed"}`, { input: input ?? {}, ok: actionOk })).catch(() => {});
     }
     // A handler that caught its own failure returns {ok:false,...}. That used to be
     // wrapped as ok:true, so a failed email read as success to the loop and the
