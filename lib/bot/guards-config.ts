@@ -88,7 +88,7 @@ export const JENSEN_BOT_GUARDS_CONFIG = defineBotConfig({
     // 'Stephen' removed (KT #339): a Sasa-only fictional-persona guard that collided
     // with Jensen's REAL contact "Stephen Sutherland", dropping legit replies. Sasa keeps it.
     'Canada Made',
-    'Sinan Agency',
+    'Zanii',
     'sinanagency',
     // 'Taona' removed (KT #340): bare-string ban dropped Jensen's OWN board, which
     // legitimately contains "Dorje contract for Taona" + "Meeting with Taona". Moved
