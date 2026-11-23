@@ -4,7 +4,7 @@
 // sendWhatsApp already enforces Law 5 (dash strip) + TRAINING gate + operator
 // mirror; this wrapper adds the persistence half of the doctrine.
 //
-// 2026-06-12: Architecture 2 pre-send gate. Shared @sinanagency/bot-guards
+// 2026-06-12: Architecture 2 pre-send gate. Shared @zanii/bot-guards
 // sanitizeReply runs with JENSEN_BOT_GUARDS_CONFIG before delivery. Catches
 // cross-bot brand leaks (Sasa / Nisria / Stephen / Cape Town Halaal mentions
 // — Jensen must NEVER reference those). On catch, body is replaced with

@@ -5,7 +5,7 @@ import { transcribeAudio as intakeTranscribeAudio } from "@/lib/intake/index.js"
 export const runtime = "nodejs";
 export const maxDuration = 90;
 
-// Audio (base64) -> @sinanagency/intake transcript -> Claude summary + tasks.
+// Audio (base64) -> @zanii/intake transcript -> Claude summary + tasks.
 // Powers voice notes, the end-of-day debrief, and meeting notes.
 export async function POST(req: NextRequest) {
   try {
