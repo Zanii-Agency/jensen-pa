@@ -1,4 +1,4 @@
-// Voice-note transcription. Thin Jensen adapter over @sinanagency/intake's
+// Voice-note transcription. Thin Jensen adapter over @zanii/intake's
 // transcribeAudio primitive. WhatsApp voice notes arrive as OGG/Opus; Whisper
 // handles that natively. Server-only.
 //

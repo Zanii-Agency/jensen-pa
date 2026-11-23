@@ -78,7 +78,7 @@ type Result = any;
 // not swipe. Wall-at-primitive: every task or event target write primitive
 // calls this guard with the resolved row title BEFORE the update.
 //
-// Lifted to @sinanagency/brain-core v0.7 on 2026-06-16 as the first primitive
+// Lifted to @zanii/brain-core v0.7 on 2026-06-16 as the first primitive
 // in the cross-bot tool registry. Jensen-side adapters wire the pure logic to
 // Jensen's contacts + chat_messages tables (Sasa uses team_members + messages;
 // CTH has no surface for this yet). Same regex, two adapter callbacks,

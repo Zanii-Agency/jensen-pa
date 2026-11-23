@@ -1,5 +1,5 @@
 // Pull readable text out of an uploaded file's raw bytes. Thin Jensen adapter
-// over @sinanagency/intake's extractTextFromBuffer primitive (PDF via unpdf,
+// over @zanii/intake's extractTextFromBuffer primitive (PDF via unpdf,
 // Word via mammoth, spreadsheets via SheetJS, plain text directly).
 //
 // Signature preserved: the third arg is still `name` (used as a filename

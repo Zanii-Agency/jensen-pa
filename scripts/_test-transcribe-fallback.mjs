@@ -1,6 +1,6 @@
 // jensen-pa transcribe primary-with-fallback test.
 //
-// The adapter at lib/transcribe.ts wraps @sinanagency/intake's transcribeAudio
+// The adapter at lib/transcribe.ts wraps @zanii/intake's transcribeAudio
 // primitive with:
 //   - 5s timeout race on the primary URL (TRANSCRIBE_PRIMARY_URL)
 //   - fallback to hosted OpenAI on timeout / error / empty
